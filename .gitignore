@@ -1,0 +1,31 @@
+# Pastas
+docs/
+refatored/tests/
+config/
+logs/
+media/
+
+# Artefatos
+*.ps1
+*.txt
+entidades.py
+anotações.md
+!README.md
+
+# Variáveis
+.env
+*.env
+!.env.example
+
+# Arquivos de cache
+__pycache__/
+
+# Arquivos de sistema
+.DS_Store
+
+# Arquivos de IDE
+.vscode/
+
+# Ambiente virtual
+venv/
+.venv/

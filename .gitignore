@@ -4,12 +4,13 @@ refatored/tests/
 config/
 logs/
 media/
+scripts/
 
 # Artefatos
 *.ps1
 *.txt
 entidades.py
-anotações.md
+*.md
 !README.md
 
 # Variáveis

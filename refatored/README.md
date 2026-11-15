@@ -25,11 +25,12 @@ Com base no relatório técnico e na revisão do código original (`aurora-gpt.p
 - **Roteamento Inteligente com LLM**: Apenas comandos que não casam com os parsers locais determinísticos recorrem à LLM (para desambiguação e extração estruturada de JSON ou bate-papo amigável).
 - **Tratamento de Quedas de Rede**: Se a LLM remota estiver fora do ar ou sofrer timeout, a Aurora responde com uma mensagem de áudio amigável, sem converter falhas de rede em alucinações de conversa.
 
-### 3. Síntese de Voz (TTS)
-- **Google Cloud TTS como Primário**: Conforme solicitado, utiliza `google-cloud-texttospeech` com a voz configurada (`pt-BR-Chirp3-HD-Erinome`).
+### 3. Síntese de Voz Pluggável e Prosódia Expressiva (TTS)
+- **Cliente TTS Multi-Provedor (`tts_client.py`)**: Espelhando a arquitetura do `llm_client.py`, permite alternar via `.env` (`TTS_PROVIDER`) entre `google` (`pt-BR-Chirp3-HD-Erinome`), `elevenlabs` (`eleven_multilingual_v2` / `eleven_flash_v2_5`) e `openrouter` (`/api/v1/audio/speech`, ex: `openai/gpt-4o-mini-tts-2025-12-15` com suporte a `instructions` de atuação e conversão automática de streams `audio/pcm` para `.wav`).
+- **Cadeia de Fallback**: Defina `TTS_FALLBACK_PROVIDERS=elevenlabs,openrouter` para contingência automática entre nuvens antes de acionar o fallback offline `config/music/falha_tts.wav`.
+- **Engenharia de Prosódia e Fonética Brasileira (RJ)**: O `PROMPT_CONVERSA` (`AURORA_SPEECH_STYLE=expressive_rj`) orienta a LLM a estruturar respostas com ritmo oral natural, marcadores discursivos, pausas dramáticas (` — `), atuação em citações (`'...'`) e entonação de pergunta final (`?`). O pipeline `prepare_text_for_speech()` preserva essa pontuação expressiva (que antes era removida pelo filtro de hífens) e converte medidas/horários abreviados (`1h30`, `85%`, `km/h`, `°C`, `R$`) para leitura natural em português.
 - **Volume temporário para fala**: Antes de reproduzir uma resposta TTS, aumenta o controle ALSA configurado e restaura volume e estado de mudo ao final. Configure `TTS_VOLUME_LEVEL` (0–100, padrão `100`), `TTS_VOLUME_CONTROL` (padrão `Master`) e, se necessário, `TTS_VOLUME_CARD` no `.env`; o pacote de sistema `alsa-utils` fornece o `amixer`.
-- **Limpeza Garantida de Arquivos Temporários**: Todos os arquivos de áudio temporários (`.mp3` e `.wav`) são gerenciados com context managers / blocos `finally`, garantindo que o disco do Orange Pi não fique lotado.
-- **Fallback de Áudio Estático**: Se o Google TTS não inicializar ou falhar, o sistema reproduz `config/music/falha_tts.wav`.
+- **Limpeza Garantida de Arquivos Temporários**: Todos os arquivos de áudio temporários (`.mp3` e `.wav`) são gerenciados com blocos `try...finally`, garantindo que o disco do Orange Pi não fique lotado.
 
 ### 4. Reprodução de áudio e logs
 - **Saída configurável**: `AUDIO_OUTPUT_DRIVER` e `AUDIO_OUTPUT_DEVICE` definem, respectivamente, o driver mpg123 (por exemplo, `alsa` ou `pulse`) e o dispositivo (por exemplo, `plughw:2,0`). Os valores padrão vazios preservam a seleção padrão do sistema. No Orange Pi, confira o dispositivo real com `aplay -l` antes de configurar; não copie o número de placa dos exemplos.
@@ -47,7 +48,8 @@ refatored/
 ├── app.py                # Ponto de entrada, orquestrador do loop de eventos e modo CLI
 ├── llm_client.py         # Cliente LLM universal pluggável (OpenRouter, Groq, Gemini, Ollama, etc.)
 ├── speech_input.py       # Microfone, calibração, wake word ('aurora') e Whisper local
-├── speech_output.py      # Google Cloud TTS (primário), fallback de áudio estático e player de som
+├── tts_client.py         # Cliente TTS universal pluggável (Google, ElevenLabs, OpenRouter) e normalização prosódica
+├── speech_output.py      # Orquestrador de fala, boost de volume ALSA, fallback estático e player de som
 ├── intent_router.py      # Orquestrador do fluxo: fast-path local + roteamento LLM
 ├── home_assistant.py     # Registro de dispositivos, parser determinístico e cliente HA seguro
 ├── music.py              # Controlador thread-safe do player de música e Navidrome

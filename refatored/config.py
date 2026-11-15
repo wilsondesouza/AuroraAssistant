@@ -78,9 +78,54 @@ OPENWEATHER_KEY = os.getenv("OPENWEATHER_KEY", "")
 OPENWEATHER_CITY = os.getenv("OPENWEATHER_CITY", "Nilópolis")
 OPENWEATHER_TIMEOUT = int(os.getenv("OPENWEATHER_TIMEOUT", "8"))
 
-# Google Cloud TTS
+# Síntese de Voz (TTS Pluggável: google, elevenlabs, openrouter)
+TTS_PROVIDER = os.getenv("TTS_PROVIDER", "google").lower().strip()
+TTS_FALLBACK_PROVIDER = os.getenv("TTS_FALLBACK_PROVIDER", "").lower().strip()
+TTS_FALLBACK_PROVIDERS = os.getenv("TTS_FALLBACK_PROVIDERS", "").strip()
+TTS_TIMEOUT = int(os.getenv("TTS_TIMEOUT", "15"))
+
+# Estilo de fala / prosódia na geração de respostas da LLM ("expressive_rj" ou "neutral")
+AURORA_SPEECH_STYLE = os.getenv("AURORA_SPEECH_STYLE", "expressive_rj").lower().strip()
+
+# Google Cloud TTS (ex: pt-BR-Chirp3-HD-Erinome)
 TTS_VOICE_NAME = os.getenv("TTS_VOICE_NAME", "pt-BR-Chirp3-HD-Erinome")
 TTS_LANGUAGE_CODE = os.getenv("TTS_LANGUAGE_CODE", "pt-BR")
+
+# ElevenLabs TTS
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "Xb7hH8MSUJpSbSDYk0k2").strip()
+ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2").strip()
+ELEVENLABS_OUTPUT_FORMAT = os.getenv("ELEVENLABS_OUTPUT_FORMAT", "mp3_44100_128").strip()
+ELEVENLABS_STABILITY = float(os.getenv("ELEVENLABS_STABILITY", "0.38"))
+ELEVENLABS_SIMILARITY_BOOST = float(os.getenv("ELEVENLABS_SIMILARITY_BOOST", "0.75"))
+ELEVENLABS_STYLE = float(os.getenv("ELEVENLABS_STYLE", "0.40"))
+ELEVENLABS_SPEAKER_BOOST = os.getenv("ELEVENLABS_SPEAKER_BOOST", "true").lower().strip() in (
+    "1", "true", "yes", "on"
+)
+
+# OpenRouter TTS (/api/v1/audio/speech)
+OPENROUTER_TTS_API_KEY = (os.getenv("OPENROUTER_TTS_API_KEY") or OPENROUTER_KEY or "").strip()
+OPENROUTER_TTS_URL = os.getenv(
+    "OPENROUTER_TTS_URL",
+    "https://openrouter.ai/api/v1/audio/speech",
+).strip()
+OPENROUTER_TTS_MODEL = os.getenv(
+    "OPENROUTER_TTS_MODEL",
+    "openai/gpt-4o-mini-tts-2025-12-15",
+).strip()
+OPENROUTER_TTS_VOICE = os.getenv("OPENROUTER_TTS_VOICE", "coral").strip()
+OPENROUTER_TTS_SPEED = float(os.getenv("OPENROUTER_TTS_SPEED", "1.0"))
+OPENROUTER_TTS_INSTRUCTIONS = os.getenv(
+    "OPENROUTER_TTS_INSTRUCTIONS",
+    (
+        "Fale em português brasileiro natural do Rio de Janeiro, com sotaque carioca leve, "
+        "caloroso e espontâneo. Use ritmo conversacional humano, pequenas variações de tom "
+        "e atuação sutil em trechos entre aspas, faça uma pausa expressiva nos travessões e "
+        "capriche na entonação ascendente e simpática nas perguntas finais."
+    ),
+).strip()
+
+# Controle de Volume ALSA durante o TTS
 TTS_VOLUME_LEVEL = int(os.getenv("TTS_VOLUME_LEVEL", "100"))
 if not 0 <= TTS_VOLUME_LEVEL <= 100:
     raise ValueError("TTS_VOLUME_LEVEL deve estar entre 0 e 100.")
@@ -123,6 +168,8 @@ def sanitize_for_log(text: str) -> str:
     cleaned = re.sub(r'([?&](?:p|password|t|token|key|appid)=)[^&]+', r'\1***', text, flags=re.IGNORECASE)
     # Ocultar Authorization Bearer
     cleaned = re.sub(r'(Bearer\s+)[A-Za-z0-9\-_.]+', r'\1***', cleaned, flags=re.IGNORECASE)
+    # Ocultar xi-api-key (ElevenLabs) caso apareça em headers serializados
+    cleaned = re.sub(r'(xi-api-key["\']?\s*[:=]\s*["\']?)[A-Za-z0-9\-_.]+', r'\1***', cleaned, flags=re.IGNORECASE)
     return cleaned
 
 def setup_logging(level=logging.INFO):
@@ -144,11 +191,35 @@ def validate_config() -> dict:
         or CEREBRAS_API_KEY
         or LLM_PROVIDER == "ollama"
     )
+    has_google_tts = bool(
+        os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        and Path(os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")).exists()
+    )
+    has_elevenlabs_tts = bool(os.getenv("ELEVENLABS_API_KEY") or ELEVENLABS_API_KEY)
+    has_openrouter_tts = bool(
+        os.getenv("OPENROUTER_TTS_API_KEY")
+        or os.getenv("OPENROUTER_KEY")
+        or OPENROUTER_TTS_API_KEY
+    )
+
+    tts_provider_norm = (os.getenv("TTS_PROVIDER", TTS_PROVIDER) or "google").lower().strip()
+    if tts_provider_norm in ("google", "gtts", "gcp", "chirp", "chirp3"):
+        active_tts_ok = has_google_tts
+    elif tts_provider_norm in ("elevenlabs", "eleven", "11labs"):
+        active_tts_ok = has_elevenlabs_tts
+    elif tts_provider_norm in ("openrouter", "or"):
+        active_tts_ok = has_openrouter_tts
+    else:
+        active_tts_ok = False
+
     status = {
         f"llm ({LLM_PROVIDER})": has_llm,
         "home_assistant": bool(HA_TOKEN and HA_URL),
         "navidrome": bool(NAVIDROME_API_URL and NAVIDROME_USER and NAVIDROME_PASSWORD),
         "openweather": bool(OPENWEATHER_KEY),
-        "google_tts": bool(os.getenv("GOOGLE_APPLICATION_CREDENTIALS") and Path(os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")).exists()),
+        f"tts ({tts_provider_norm})": active_tts_ok,
+        "google_tts": has_google_tts,
+        "elevenlabs_tts": has_elevenlabs_tts,
+        "openrouter_tts": has_openrouter_tts,
     }
     return status

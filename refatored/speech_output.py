@@ -13,13 +13,16 @@ from refatored.config import (
     CONFIRMATION_SOUND,
     ERROR_SOUND,
     FALHA_TTS_SOUND,
-    TTS_VOICE_NAME,
-    TTS_LANGUAGE_CODE,
     TTS_VOLUME_LEVEL,
     TTS_VOLUME_CONTROL,
     TTS_VOLUME_CARD,
     AUDIO_OUTPUT_DRIVER,
     AUDIO_OUTPUT_DEVICE,
+)
+from refatored.tts_client import (
+    TTSClient,
+    tts_client,
+    prepare_text_for_speech,
 )
 
 logger = logging.getLogger(__name__)
@@ -33,6 +36,15 @@ def _build_mpg123_command(target: str) -> list[str]:
         cmd.extend(["-o", AUDIO_OUTPUT_DRIVER])
     if AUDIO_OUTPUT_DEVICE:
         cmd.extend(["-a", AUDIO_OUTPUT_DEVICE])
+    cmd.append(target)
+    return cmd
+
+
+def _build_aplay_command(target: str) -> list[str]:
+    """Monta a linha de comando do aplay (ALSA) para arquivos WAV."""
+    cmd = ["aplay", "-q"]
+    if AUDIO_OUTPUT_DEVICE and AUDIO_OUTPUT_DRIVER in ("", "alsa"):
+        cmd.extend(["-D", AUDIO_OUTPUT_DEVICE])
     cmd.append(target)
     return cmd
 
@@ -169,8 +181,11 @@ def play_audio_file(caminho: str, blocking: bool = False) -> bool:
         return False
 
     def _play() -> bool:
+        is_wav = caminho.lower().endswith(".wav")
         players = []
-        if shutil.which("mpg123"):
+        if is_wav and shutil.which("aplay"):
+            players.append(("aplay", _build_aplay_command(caminho)))
+        if not is_wav and shutil.which("mpg123"):
             players.append(("mpg123", _build_mpg123_command(caminho)))
         if shutil.which("ffplay"):
             players.append(
@@ -249,105 +264,98 @@ def play_falha_tts():
 
 
 # ==========================================
-# SÍNTESE DE VOZ (TTS)
+# SÍNTESE DE VOZ (TTS PLUGGÁVEL COM FALLBACK)
 # ==========================================
 
 def clean_text_for_speech(texto: str) -> str:
-    """Remove caracteres Markdown, formatação e símbolos que prejudicam a fala."""
-    if not texto:
-        return ""
-    # Remove marcações Markdown
-    t = re.sub(r'[*_#`~\[\]\(\)\{\}]', '', texto)
-    t = re.sub(r'[-–—]\s+', ' ', t)
-    t = re.sub(r'\s+', ' ', t)
-    return t.strip()
+    """
+    Prepara texto para síntese de voz: remove Markdown/emojis e preserva
+    pontuação prosódica (travessões '—', reticências '...', aspas, '!' e '?')
+    além de expandir unidades/horários abreviados em português brasileiro.
+    """
+    return prepare_text_for_speech(texto)
+
+
+def _play_synthesized_bytes(audio_bytes: bytes, ext: str = ".mp3") -> bool:
+    """Salva bytes de áudio sintetizado em arquivo temporário seguro, reproduz e limpa."""
+    if not audio_bytes:
+        return False
+
+    suffix = ext if ext.startswith(".") else f".{ext}"
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+            temp_path = f.name
+            f.write(audio_bytes)
+
+        return play_audio_file(temp_path, blocking=True)
+    except Exception as e:
+        logger.error(f"Erro ao gravar/reproduzir áudio temporário de TTS: {e}")
+        return False
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
 
 
 class GoogleCloudTTS:
-    """Motor de síntese de voz usando Google Cloud Text-to-Speech."""
+    """
+    Adaptador retrocompatível específico do Google Cloud Text-to-Speech,
+    delegando para o cliente pluggável TTSClient.
+    """
 
-    def __init__(self):
-        self._client = None
-        self._initialized = False
-
-    def _ensure_client(self):
-        if not self._initialized:
-            try:
-                from google.cloud import texttospeech
-                self._client = texttospeech.TextToSpeechClient()
-                self._texttospeech = texttospeech
-                self._initialized = True
-                logger.info("Google Cloud TTS inicializado com sucesso.")
-            except Exception as e:
-                logger.error(f"Não foi possível inicializar Google Cloud TTS: {e}")
-                self._client = None
-                self._initialized = True
+    def __init__(self, client: TTSClient | None = None):
+        self._tts_client = client or tts_client
 
     def synthesize_and_play(self, texto: str) -> bool:
-        """Sintetiza texto com Google TTS e reproduz."""
-        self._ensure_client()
-        if self._client is None:
+        """Sintetiza texto especificamente via Google TTS e reproduz."""
+        resultado = self._tts_client.sintetizar(texto, provider_override="google")
+        if not resultado:
             return False
-
-        texto_limpo = clean_text_for_speech(texto)
-        if not texto_limpo:
-            return False
-
-        temp_path = None
-        try:
-            tts = self._texttospeech
-            synthesis_input = tts.SynthesisInput(text=texto_limpo)
-            voice = tts.VoiceSelectionParams(
-                language_code=TTS_LANGUAGE_CODE,
-                name=TTS_VOICE_NAME
-            )
-            audio_config = tts.AudioConfig(audio_encoding=tts.AudioEncoding.MP3)
-
-            logger.info(f"Sintetizando voz (Google TTS, voz={TTS_VOICE_NAME}): '{texto_limpo[:60]}...'")
-            response = self._client.synthesize_speech(
-                input=synthesis_input,
-                voice=voice,
-                audio_config=audio_config
-            )
-
-            # Gravar em arquivo temporário com limpeza garantida
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-                temp_path = f.name
-                f.write(response.audio_content)
-
-            # Reproduz de forma bloqueante para sincronizar a fala com a resposta
-            return play_audio_file(temp_path, blocking=True)
-
-        except Exception as e:
-            logger.error(f"Erro na síntese com Google Cloud TTS: {e}")
-            return False
-        finally:
-            if temp_path and os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except Exception:
-                    pass
+        audio_bytes, ext, _ = resultado
+        return _play_synthesized_bytes(audio_bytes, ext=ext)
 
 
 class TextToSpeechManager:
-    """Gerenciador central de TTS com fallback de áudio estático."""
+    """
+    Gerenciador central de TTS multi-provedor (Google Chirp3-HD, ElevenLabs, OpenRouter)
+    com cadeia de fallback configurável via .env e áudio estático de contingência final.
+    """
 
-    def __init__(self):
-        self.gcp_tts = GoogleCloudTTS()
+    def __init__(self, client: TTSClient | None = None):
+        self.client = client or tts_client
+        self.gcp_tts = GoogleCloudTTS(self.client)
 
-    def falar(self, texto: str):
-        """Tenta usar Google Cloud TTS; se falhar, reproduz o áudio estático de erro."""
+    def synthesize_and_play(self, texto: str, provider_override: str | None = None) -> bool:
+        """Sintetiza usando o provedor ativo (e seus fallbacks) e reproduz."""
+        resultado = self.client.sintetizar(texto, provider_override=provider_override)
+        if not resultado:
+            return False
+        audio_bytes, ext, used_provider = resultado
+        logger.debug(f"Reproduzindo fala sintetizada via [{used_provider.upper()}] ({ext})...")
+        return _play_synthesized_bytes(audio_bytes, ext=ext)
+
+    def falar(self, texto: str, provider_override: str | None = None):
+        """
+        Sintetiza e reproduz a fala com aumento temporário de volume ALSA;
+        se todos os provedores de TTS falharem, reproduz o áudio estático de erro.
+        """
         if not texto or not texto.strip():
             return
 
         with _temporarily_boost_tts_volume():
-            if not self.gcp_tts.synthesize_and_play(texto):
-                logger.error("Google Cloud TTS indisponível; reproduzindo fala gravada.")
+            if not self.synthesize_and_play(texto, provider_override=provider_override):
+                logger.error(
+                    "Todos os provedores de TTS falharam; reproduzindo áudio estático de contingência."
+                )
                 play_falha_tts()
 
 
 # Instância global singleton
 tts_manager = TextToSpeechManager()
+
 
 def falar(texto: str):
     """Função utilitária global para fala da Aurora."""

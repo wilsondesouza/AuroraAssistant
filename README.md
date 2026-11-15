@@ -36,9 +36,13 @@ A Aurora combina **reconhecimento de voz** (Speech Recognition ), **automação 
 - **Proteção de Credenciais**: Senhas e tokens nunca são salvos em logs nem em arquivos de playlist; autenticação moderna via salt/token MD5.
 - **Compatibilidade de Reprodutores**: Seleção automática entre `mpg123`, `ffplay`, `vlc` ou reprodutor do sistema.
 
-### 🗣️ Síntese de Voz Expressiva (TTS)
-- **Google Cloud TTS (Primário)**: Voz natural de alta fidelidade em português brasileiro (`pt-BR-Chirp3-HD-Erinome`).
-- **Fallback de Áudio Estático**: Se o Google Cloud TTS não inicializar ou falhar, reproduz o áudio estático de erro (`config/music/falha_tts.wav`).
+### 🗣️ Síntese de Voz Pluggável & Prosódia Expressiva (TTS)
+- **Cliente TTS Multi-Provedor (`tts_client.py`)**: Alterne via `.env` (`TTS_PROVIDER`) entre:
+  - **Google Cloud TTS (`google`)**: Voz neural de alta fidelidade em português brasileiro (`pt-BR-Chirp3-HD-Erinome`).
+  - **ElevenLabs (`elevenlabs`)**: Suporte nativo aos modelos `eleven_multilingual_v2` (atuação rica em pt-BR), `eleven_flash_v2_5` (baixa latência) e `eleven_v3`, com controle fino de `stability` e `style`.
+  - **OpenRouter Audio Speech (`openrouter`)**: Integração via `/api/v1/audio/speech` (ex: `openai/gpt-4o-mini-tts-2025-12-15` com `instructions` de direção vocal carioca e empacotamento automático WAV para modelos PCM).
+- **Cadeia de Fallback Automático**: Configure `TTS_FALLBACK_PROVIDERS=elevenlabs,openrouter` para contingência automática em caso de queda ou limite de cota; se todos falharem (ou sem internet), reproduz o áudio estático de contingência (`config/music/falha_tts.wav`).
+- **Prosódia Conversacional Carioca (pt-BR / RJ)**: System prompt e pipeline fonético otimizados para preservar pausas dramáticas (`—`), atuação vocal em citações (`'...'`), reticências (`...`), entonação de pergunta final (`?`) e leitura natural por extenso de horários e medidas.
 
 ### ⏱️ Habilidades Rápidas (Hora e Clima)
 - **Hora Certa por Extenso**: Algoritmo local em português (*"Agora são duas e vinte da tarde"*).
@@ -66,7 +70,8 @@ AuroraAssistant/
 │   ├── home_assistant.py             ← Registry de entidades, parser determinístico e cliente HA
 │   ├── music.py                      ← Controlador thread-safe do player e Navidrome
 │   ├── speech_input.py               ← Microfone, ruído ambiente, wake word e Whisper local
-│   ├── speech_output.py              ← Google Cloud TTS primário + fallback de áudio estático
+│   ├── tts_client.py                 ← Cliente TTS universal pluggável (Google, ElevenLabs, OpenRouter) + normalização prosódica
+│   ├── speech_output.py              ← Gerenciador de fala, boost de volume ALSA, player e fallback de áudio estático
 │   ├── local_intents.py              ← Intenções locais rápidas (Hora por extenso e OpenWeather)
 │   ├── prompts.py                    ← Prompts otimizados e versionados
 │   │

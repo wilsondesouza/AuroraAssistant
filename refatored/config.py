@@ -175,6 +175,19 @@ MEMORY_USE_EMBEDDINGS = os.getenv("MEMORY_USE_EMBEDDINGS", "true").lower().strip
 )
 GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-001").strip()
 
+# Busca na Web em Tempo Real / Grounding Pluggável (auto, serper, tavily, free)
+WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "true").lower().strip() in (
+    "1", "true", "yes", "on"
+)
+WEB_SEARCH_PROVIDER = os.getenv("WEB_SEARCH_PROVIDER", "auto").lower().strip()
+WEB_SEARCH_FALLBACK_PROVIDERS = os.getenv(
+    "WEB_SEARCH_FALLBACK_PROVIDERS", "serper,tavily,free"
+).strip()
+WEB_SEARCH_MAX_RESULTS = max(1, min(6, int(os.getenv("WEB_SEARCH_MAX_RESULTS", "4"))))
+WEB_SEARCH_TIMEOUT = int(os.getenv("WEB_SEARCH_TIMEOUT", "8"))
+SERPER_API_KEY = os.getenv("SERPER_API_KEY", "").strip()
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
+
 # Capacidades Avançadas de LLM (Structured Output, Tool Calling & Streaming TTS)
 LLM_USE_JSON_MODE = os.getenv("LLM_USE_JSON_MODE", "true").lower().strip() in (
     "1", "true", "yes", "on"
@@ -201,13 +214,14 @@ def sanitize_for_log(text: str) -> str:
     cleaned = re.sub(r'([?&](?:p|password|t|token|key|appid)=)[^&]+', r'\1***', text, flags=re.IGNORECASE)
     # Ocultar Authorization Bearer
     cleaned = re.sub(r'(Bearer\s+)[A-Za-z0-9\-_.]+', r'\1***', cleaned, flags=re.IGNORECASE)
-    # Ocultar xi-api-key (ElevenLabs) e x-goog-api-key (Gemini) caso apareçam em logs
+    # Ocultar xi-api-key (ElevenLabs), x-goog-api-key (Gemini), X-API-KEY (Serper) e chaves tvly- (Tavily)
     cleaned = re.sub(
-        r'((?:xi-api-key|x-goog-api-key)["\']?\s*[:=]\s*["\']?)[A-Za-z0-9\-_.]+',
+        r'((?:xi-api-key|x-goog-api-key|x-api-key|api_key)["\']?\s*[:=]\s*["\']?)[A-Za-z0-9\-_.]+',
         r'\1***',
         cleaned,
         flags=re.IGNORECASE,
     )
+    cleaned = re.sub(r'\btvly-[A-Za-z0-9\-_]+\b', 'tvly-***', cleaned)
     return cleaned
 
 def setup_logging(level=logging.INFO):
@@ -250,11 +264,17 @@ def validate_config() -> dict:
     else:
         active_tts_ok = False
 
+    web_enabled = os.getenv("WEB_SEARCH_ENABLED", str(WEB_SEARCH_ENABLED)).lower().strip() in (
+        "1", "true", "yes", "on"
+    )
+    web_prov = (os.getenv("WEB_SEARCH_PROVIDER", WEB_SEARCH_PROVIDER) or "auto").lower().strip()
+
     status = {
         f"llm ({LLM_PROVIDER})": has_llm,
         "home_assistant": bool(HA_TOKEN and HA_URL),
         "navidrome": bool(NAVIDROME_API_URL and NAVIDROME_USER and NAVIDROME_PASSWORD),
         "openweather": bool(OPENWEATHER_KEY),
+        f"web_search ({web_prov})": web_enabled,
         f"tts ({tts_provider_norm})": active_tts_ok,
         "google_tts": has_google_tts,
         "elevenlabs_tts": has_elevenlabs_tts,

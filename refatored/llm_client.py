@@ -90,6 +90,7 @@ class LLMClient:
         self.provider = os.getenv("LLM_PROVIDER", "openrouter").lower().strip()
         self.custom_base_url = os.getenv("LLM_BASE_URL", "").strip()
         self.fallback_provider = os.getenv("LLM_FALLBACK_PROVIDER", "").lower().strip()
+        self.last_call_rejected_tools = False
 
     def get_api_key_for_provider(self, provider_name: str) -> str:
         """Recupera a chave de API apropriada para o provedor selecionado."""
@@ -310,12 +311,15 @@ class LLMClient:
         max_steps: Optional[int] = None,
         timeout: int = 15,
         provider_override: Optional[str] = None,
+        fallback_on_unsupported: bool = True,
     ) -> Tuple[Optional[str], bool]:
         """
         Executa chamada com Tool Calling limitado (max_steps <= 3 para proteger o Free-Tier).
         Retorna (resposta_final, usou_alguma_tool).
-        Se o modelo não suportar 'tools' (HTTP 400/404/422), faz fallback transparente para chamar().
+        Se o modelo não suportar 'tools' (HTTP 400/404/422), faz fallback transparente para chamar()
+        quando fallback_on_unsupported=True.
         """
+        self.last_call_rejected_tools = False
         if requests is None:
             logger.error("Biblioteca 'requests' ausente.")
             return None, False
@@ -359,12 +363,14 @@ class LLMClient:
                     )
                 return None, used_any_tool
 
-            # Modelo gratuito sem suporte a function calling -> degrada suavemente para conversa normal
+            # Modelo gratuito sem suporte a function calling -> sinaliza ou degrada suavemente
             if resp.status_code in (400, 404, 422) and allow_tools_now and not used_any_tool:
+                self.last_call_rejected_tools = True
                 logger.info(
-                    f"Modelo '{adapted_model}' não aceitou 'tools' (HTTP {resp.status_code}); "
-                    f"usando conversa direta sem tools."
+                    f"Modelo '{adapted_model}' não aceitou 'tools' (HTTP {resp.status_code})."
                 )
+                if not fallback_on_unsupported:
+                    return None, False
                 texto_fallback = self.chamar(
                     modelo,
                     "",

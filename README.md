@@ -49,7 +49,7 @@ A Aurora combina **reconhecimento de voz** (Speech Recognition ), **automação 
 - **Janela de Contexto Deslizante + Conversa Contínua**: Mantém memória curta dos últimos turnos em RAM (com expiração automática de 3 min) e abre escuta automática com bip quando a Aurora encerra uma fala fazendo uma pergunta (`?`).
 - **Multi-Comando e Anáfora no Home Assistant**: Suporta comandos compostos (*"apaga a luz da sala e liga o ar condicionado"*) e referências ao último dispositivo (*"agora apaga ela"*), além de consultar estados (*"tem alguma luz ligada em casa?"*).
 - **Memória da Casa (Mini-RAG Ultra-Leve em SQLite)**: Guarda e recupera notas permanentes da família por voz (*"Aurora, lembra que o remédio da vó é às 8h na caixa azul"*) usando `sqlite3` FTS5 nativo + Embeddings semânticos gratuitos opcionais via Gemini API (0 MB de peso em IA local no Orange Pi).
-- **Timers Falados, Música Atual e Tool Calling Seletivo**: Cronômetros em thread (*"me avisa daqui a 10 minutos pra olhar o forno"*), consulta da faixa atual do Navidrome e *Sentence-Level Streaming* da LLM para o TTS.
+- **Timers Falados, Música Atual, Busca na Web em Tempo Real e Tool Calling Seletivo**: Cronômetros em thread (*"me avisa daqui a 10 minutos pra olhar o forno"*), consulta da faixa atual do Navidrome, **Web Search Grounding pluggável** (`Serper` Google BR + `Tavily` + fallback `free` zero-chave via DuckDuckGo/Google News RSS para placares de jogos, notícias e cotações) e *Sentence-Level Streaming* da LLM para o TTS.
 
 ---
 
@@ -72,7 +72,8 @@ AuroraAssistant/
 │   ├── intent_router.py              ← Roteador central (Fast-path local + Contexto + Mini-RAG + LLM sob demanda)
 │   ├── conversation_memory.py        ← Janela deslizante curta em RAM com TTL, anáfora HA e suporte a Prompt Caching
 │   ├── memory_store.py               ← Memória da Casa (Mini-RAG em SQLite FTS5 + Embeddings Gemini em Python puro)
-│   ├── skills.py                     ← Timers falados em thread, consulta de música atual e registro de Tools
+│   ├── web_search_client.py          ← Busca na Web pluggável (Serper, Tavily e modo gratuito sem chave DDG + Google News RSS)
+│   ├── skills.py                     ← Timers falados, música atual, pesquisa web e registro de Tools
 │   ├── home_assistant.py             ← Registry seguro, parser simples/multi/anafórico, lote JSON e consulta de estado HA
 │   ├── music.py                      ← Controlador thread-safe do player e Navidrome
 │   ├── speech_input.py               ← Microfone, ruído ambiente, wake word e Whisper local

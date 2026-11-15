@@ -20,6 +20,7 @@ from refatored.home_assistant import (
 from refatored.memory_store import memory_store
 from refatored.conversation_memory import conversation_memory
 from refatored.speech_output import play_confirmation, falar
+from refatored.web_search_client import web_search_client
 
 logger = logging.getLogger(__name__)
 
@@ -463,6 +464,28 @@ TOOLS_SPEC: List[Dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "pesquisar_na_web",
+            "description": (
+                "Pesquisa informações atuais ou em tempo real na internet: placares e resultados "
+                "de jogos de futebol, notícias recentes, cotações (dólar, bitcoin), eventos atuais, "
+                "feriados, estreias ou fatos sobre os quais não haja certeza. Inclua mês/ano atual "
+                "na consulta ao buscar acontecimentos recentes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "consulta": {
+                        "type": "string",
+                        "description": "Consulta objetiva em português para o buscador web (ex: 'resultado último jogo seleção brasileira novembro 2026').",
+                    }
+                },
+                "required": ["consulta"],
+            },
+        },
+    },
 ]
 
 
@@ -548,6 +571,12 @@ def execute_tool_call(tool_name: str, raw_arguments: Any) -> str:
             if not achados:
                 return "Nenhuma memória encontrada sobre esse assunto."
             return "Memórias encontradas: " + " | ".join(achados)
+
+        elif tool_name == "pesquisar_na_web":
+            consulta = str(args.get("consulta", "")).strip()
+            if not consulta:
+                return "Consulta de busca vazia."
+            return web_search_client.buscar_contexto_formatado(consulta)
 
         return f"Ferramenta '{tool_name}' não reconhecida."
     except Exception as e:

@@ -2,6 +2,7 @@ import json
 import os
 import re
 import logging
+from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
 
 try:
@@ -39,6 +40,7 @@ from refatored.conversation_memory import (
     should_expect_followup,
 )
 from refatored.memory_store import memory_store, handle_memory_command_local
+from refatored.web_search_client import web_search_client
 from refatored.skills import (
     parse_timer_local,
     parse_music_query_local,
@@ -47,6 +49,34 @@ from refatored.skills import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Sinais de perguntas sobre eventos atuais, placares esportivos, cotações ou busca na internet
+_RE_WEB_SEARCH_HINT = re.compile(
+    r"\b(?:jogo|placar|partida|rodada|gol|gols|ganhou|perdeu|empatou|venceu|"
+    r"campeonato|brasileir[ãa]o|libertadores|copa|eliminat[óo]rias|sele[çc][ãa]o|"
+    r"flamengo|vasco|fluminense|botafogo|corinthians|palmeiras|s[ãa]o\s+paulo|santos|gr[êe]mio|cruzeiro|"
+    r"not[íi]cias?|manchetes?|aconteceu|ultimas|últimas|hoje|ontem|essa\s+semana|"
+    r"d[óo]lar|euro|bitcoin|cota[çc][ãa]o|selic|bolsa|ibovespa|infla[çc][ãa]o|"
+    r"feriado|elei[çc][ãa]o|atual|atualmente|quem\s+[ée]\s+o\s+(?:atual|novo|t[ée]cnico|presidente|prefeito)|"
+    r"quanto\s+foi|quanto\s+(?:t[áa]|est[áa])\s+o|pesquisa(?:r)?(?:\s+na\s+(?:web|internet))?|"
+    r"procura(?:r)?\s+na\s+internet|busca(?:r)?\s+no\s+google)\b",
+    re.IGNORECASE,
+)
+
+# Gatilho forte de tempo real (garante fallback automático de RAG Web direto caso um modelo não chame a tool)
+_RE_STRONG_WEB_QUERY = re.compile(
+    r"\b(?:quanto\s+foi\s+o\s+jogo|qual\s+(?:foi\s+)?o\s+placar|resultado\s+do\s+jogo|"
+    r"quem\s+ganhou\s+o\s+jogo|quanto\s+(?:t[áa]|est[áa])\s+o\s+(?:d[óo]lar|euro|bitcoin)|"
+    r"cota[çc][ãa]o\s+do\s+(?:d[óo]lar|euro|bitcoin)|not[íi]cias?\s+(?:de\s+hoje|sobre|atuais)|"
+    r"pesquisa(?:r)?\s+na\s+(?:web|internet)|busca(?:r)?\s+no\s+google)\b",
+    re.IGNORECASE,
+)
+
+_RE_NO_REALTIME_REFUSAL = re.compile(
+    r"\b(?:n[ãa]o\s+tenho\s+acesso\s+(?:[àa]\s+internet|em\s+tempo\s+real)|"
+    r"meu\s+conhecimento\s+vai\s+at[ée]|data\s+de\s+corte|n[ãa]o\s+consigo\s+consultar\s+a\s+internet)\b",
+    re.IGNORECASE,
+)
 
 # Gatilho leve para ativar Tool Calling apenas quando a frase sugerir ação/consulta híbrida,
 # economizando ~650 tokens de schema em conversas casuais e preservando o streaming de voz!
@@ -79,6 +109,8 @@ def _may_require_tools(mensagem: str, has_recent_ha_context: bool = False) -> bo
     if not mensagem:
         return False
     if _RE_HYBRID_TOOL_HINT.search(mensagem):
+        return True
+    if web_search_client.is_enabled() and _RE_WEB_SEARCH_HINT.search(mensagem):
         return True
     if has_recent_ha_context and len(mensagem.split()) <= 8 and _RE_CONTEXTUAL_HA_FOLLOWUP.search(mensagem):
         return True
@@ -478,15 +510,29 @@ class IntentRouter:
         if fatos_relevantes:
             logger.info(f"Mini-RAG injetou {len(fatos_relevantes)} memória(s) da casa no contexto.")
 
-        # 2. Verificar se há contexto recente de conferência/acionamento de dispositivo HA
+        # 2. Verificar contexto recente HA e necessidade de Tools / Busca Web
         ultimo_alvo_ha, ultimo_estado_ha, ultimos_alvos_lista = (
             conversation_memory.get_last_ha_context()
         )
-        precisa_tools = force_tools or _may_require_tools(
+        eh_busca_web = bool(
+            web_search_client.is_enabled() and _RE_WEB_SEARCH_HINT.search(mensagem)
+        )
+        eh_busca_web_forte = bool(
+            web_search_client.is_enabled() and _RE_STRONG_WEB_QUERY.search(mensagem)
+        )
+        precisa_tools = force_tools or eh_busca_web or _may_require_tools(
             mensagem, has_recent_ha_context=bool(ultimo_alvo_ha)
         )
 
-        ha_hint: Optional[str] = None
+        notas_contexto: List[str] = []
+        if eh_busca_web:
+            hoje_str = datetime.now().strftime("%d/%m/%Y")
+            notas_contexto.append(
+                f"Data atual do sistema: {hoje_str}. Para responder sobre resultados de jogos, "
+                f"placares, notícias, cotações ou acontecimentos atuais/recentes, use a ferramenta "
+                f"pesquisar_na_web antes de responder e nunca invente placares ou datas."
+            )
+
         if precisa_tools and ultimo_alvo_ha:
             alvos_txt = (
                 ", ".join(ultimos_alvos_lista)
@@ -494,7 +540,7 @@ class IntentRouter:
                 else ultimo_alvo_ha
             )
             estado_txt = f" (último estado observado: {ultimo_estado_ha})" if ultimo_estado_ha else ""
-            ha_hint = (
+            notas_contexto.append(
                 f"Contexto recente da casa: dispositivo(s) em foco na interação anterior: "
                 f"{alvos_txt}{estado_txt}. Se a mensagem atual do usuário confirmar ou pedir "
                 f"uma ação sobre esse(s) dispositivo(s) (ex: 'sim', 'quero', 'pode apagar', "
@@ -503,12 +549,14 @@ class IntentRouter:
                 f"responda normalmente."
             )
 
+        dynamic_hint = "\n\n".join(notas_contexto) if notas_contexto else None
+
         # 3. Montar mensagens mantendo PROMPT_CONVERSA fixo na posição 0 (Prompt Caching friendly)
         messages = conversation_memory.build_messages(
             static_system_prompt=PROMPT_CONVERSA,
             user_message=mensagem,
             rag_facts=fatos_relevantes,
-            ha_context_hint=ha_hint,
+            ha_context_hint=dynamic_hint,
         )
 
         # Compatibilidade total caso chamar_modelo tenha sido substituído por mock em testes:
@@ -539,16 +587,44 @@ class IntentRouter:
             else LLM_STREAM_TTS
         )
 
-        # 4a. Se a mensagem sugerir ação híbrida ou confirmação pós-consulta de estado HA, usa Tool Calling (max_steps<=2)
+        # 4a. Tool Calling seletivo (inclui pesquisar_na_web, memória, timers e controle HA)
         if use_tools and precisa_tools:
-            resposta, _ = llm_client.chamar_com_tools(
+            resposta, usou_tool = llm_client.chamar_com_tools(
                 modelo=MODEL_CONVERSA,
                 messages=messages,
                 tools=TOOLS_SPEC,
                 tool_executor=execute_tool_call,
+                fallback_on_unsupported=not eh_busca_web,
             )
+
+            # Fallback Web-RAG Direto: se o modelo gratuito não suportar 'tools' (rejeitou com 400)
+            # OU se recusou dizendo 'não tenho acesso em tempo real' sem chamar pesquisar_na_web:
+            precisa_rag_web_direto = (
+                eh_busca_web and not resposta and llm_client.last_call_rejected_tools
+            ) or (
+                eh_busca_web_forte
+                and not usou_tool
+                and (not resposta or bool(_RE_NO_REALTIME_REFUSAL.search(resposta)))
+            )
+
+            if precisa_rag_web_direto:
+                logger.info("Acionando Fallback de RAG Web Direto antes da síntese da LLM...")
+                contexto_web = web_search_client.buscar_contexto_formatado(mensagem)
+                msgs_web_rag = conversation_memory.build_messages(
+                    static_system_prompt=PROMPT_CONVERSA,
+                    user_message=mensagem,
+                    rag_facts=fatos_relevantes,
+                    ha_context_hint=contexto_web,
+                )
+                resposta = chamar_modelo(
+                    MODEL_CONVERSA,
+                    PROMPT_CONVERSA,
+                    mensagem,
+                    messages_override=msgs_web_rag,
+                )
+
             if resposta:
-                logger.info(f"Resposta IA (com suporte a tools): '{resposta[:80]}...'")
+                logger.info(f"Resposta IA (com suporte a tools/web): '{resposta[:80]}...'")
                 falar(resposta)
                 conversation_memory.add_turn(mensagem, resposta)
                 return {
@@ -558,6 +634,17 @@ class IntentRouter:
                     "expect_followup": should_expect_followup(resposta),
                 }
             return self._falha_conversa()
+
+        # 4b. Caso LLM_ENABLE_TOOLS=false mas WEB_SEARCH_ENABLED=true em pergunta explícita da web:
+        if not use_tools and eh_busca_web_forte:
+            logger.info("Executando RAG Web Direto (LLM_ENABLE_TOOLS=false)...")
+            contexto_web = web_search_client.buscar_contexto_formatado(mensagem)
+            messages = conversation_memory.build_messages(
+                static_system_prompt=PROMPT_CONVERSA,
+                user_message=mensagem,
+                rag_facts=fatos_relevantes,
+                ha_context_hint=contexto_web,
+            )
 
         # 3b. Conversa direta com Streaming por Frase Completa (menor latência até a voz sair)
         if use_stream:

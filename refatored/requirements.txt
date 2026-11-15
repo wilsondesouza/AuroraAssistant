@@ -1,0 +1,31 @@
+# ==============================================================================
+# Aurora Assistant — dependências
+# Requer Python >= 3.10 (o código usa `str | None` e `list[str]`).
+# ==============================================================================
+
+# --- Núcleo HTTP / configuração ------------------------------------------------
+requests>=2.31,<3
+python-dotenv>=1.0,<2
+
+# --- Entrada de voz ------------------------------------------------------------
+SpeechRecognition>=3.10,<4
+PyAudio>=0.2.14            # exige: sudo apt install portaudio19-dev
+# STT local (obrigatório para privacidade — ver §4.2 do relatório).
+# No Orange Pi use compute_type="int8" e cpu_threads=2 (já configurado em config.py).
+faster-whisper>=1.0,<2
+# Alternativa mais leve para wake word contínua (recomendada — PERF-02):
+# openwakeword>=0.6
+# Alternativa de STT streaming de baixo consumo (PERF-01):
+# vosk>=0.3.45
+
+# --- Síntese de voz -----------------------------------------------------------
+google-cloud-texttospeech>=2.16,<3     # TTS_PROVIDER=google (Chirp3-HD)
+
+# --- Opcionais por feature ----------------------------------------------------
+# feedparser>=6.0        # F-12 notícias por RSS
+# trafilatura>=1.8       # F-17 extração de texto de páginas web
+# icalendar>=5.0         # F-11 agenda via ICS/CalDAV
+# cryptography>=42       # SEC-06 criptografia da Memória da Casa em repouso
+
+# NOTA: não há dependência de numpy/torch no projeto por decisão de arquitetura
+# (Mini-RAG em Python puro). Mantenha assim: o H6 agradece.

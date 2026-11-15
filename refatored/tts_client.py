@@ -129,6 +129,18 @@ def _expand_currency_brl(match: re.Match) -> str:
     return f"{inteiro} {moeda}"
 
 
+def _expand_currency_usd(match: re.Match) -> str:
+    """Converte 'US$ 5,80' para leitura fluida em português."""
+    inteiro = int(match.group(1))
+    centavos = match.group(2)
+    moeda = "dólar" if inteiro == 1 else "dólares"
+    if centavos and int(centavos) > 0:
+        cent_num = int(centavos)
+        cent_palavra = "centavo" if cent_num == 1 else "centavos"
+        return f"{inteiro} {moeda} e {cent_num} {cent_palavra}"
+    return f"{inteiro} {moeda}"
+
+
 def prepare_text_for_speech(texto: str) -> str:
     """
     Limpa artefatos visuais (Markdown, emojis, URLs) MAS preserva integralmente
@@ -171,7 +183,15 @@ def prepare_text_for_speech(texto: str) -> str:
     t = t.replace("…", "...")
     t = re.sub(r"\.{2,}", "...", t)
 
-    # 7. Normalizações fonéticas pt-BR (unidades, moedas e horários compactos)
+    # 7. Normalizações fonéticas pt-BR (placares esportivos, unidades, moedas e horários)
+    # Ex: '3x2', '3 x 2' ou 'Japão 3-2 Brasil' -> '3 a 2' (evita o TTS ler 'três xis dois' ou 'três menos dois'!)
+    t = re.sub(r"\b(\d{1,2})\s*[xX×]\s*(\d{1,2})\b", r"\1 a \2", t)
+    t = re.sub(
+        r"(?<=[A-Za-zÀ-ÿ]\s)(\d{1,2})\s*[-–]\s*(\d{1,2})(?=\s+[A-Za-zÀ-ÿ:])",
+        r"\1 a \2",
+        t,
+    )
+    t = re.sub(r"US\$\s*(\d+)(?:[.,](\d{2}))?\b", _expand_currency_usd, t)
     t = re.sub(r"R\$\s*(\d+)(?:,(\d{2}))?\b", _expand_currency_brl, t)
     t = re.sub(r"(-?\d+)\s*[°º]\s*[cC]\b", r"\1 graus", t)
     t = re.sub(r"(\d+(?:[.,]\d+)?)\s*%", r"\1 por cento", t)

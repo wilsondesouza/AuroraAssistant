@@ -1,32 +1,49 @@
-# Pastas
-docs/
-refatored/tests/
-config/
+# ==============================================================================
+# .gitignore para a AuroraAssistant
+# ==============================================================================
+
+# --- Segredos -----------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.env
+secrets/
+config/*.json
+config/**/keys.env
+config/**/gtts-file.json
+config/**/gtts-example.json
+service-account*.json
+*.pem
+*.key
+*.txt
+*.md
+*.ps1
+
+# --- Dados gerados em runtime -------------------------------------------------
+config/memory/
+config/music/*.json
+config/music/*.txt
 logs/
 media/
+
+# --- Artefatos -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
 scripts/
 
-# Artefatos
-*.ps1
-*.txt
-entidades.py
-*.md
-!README.md
-
-# Variáveis
-.env
-*.env
-!.env.example
-
-# Arquivos de cache
-__pycache__/
-
-# Arquivos de sistema
+# --- Sistema / IDE -------------------------------------------------------------
 .DS_Store
-
-# Arquivos de IDE
 .vscode/
+.idea/
 
-# Ambiente virtual
-venv/
-.venv/
+# --- Versionamento Explícito ---------------------------------------------------
+!requirements.txt
+!README.md
+!refatored/tests/

@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # ==========================================
 
 RE_TIME = re.compile(
-    r'\b(que\s+horas?\s+s[ãa]o|que\s+horas?\s+[eé]|qual\s+a\s+hora|hora\s+certa|horas?\s+s[ãa]o|diga\s+as\s+horas|tem)\b',
+    r'\b(que\s+horas?\s+s[ãa]o|que\s+horas?\s+[eé]|qual\s+a\s+hora|hora\s+certa|horas?\s+s[ãa]o|diga\s+as\s+horas|tem\s+horas?)\b',
     re.IGNORECASE
 )
 

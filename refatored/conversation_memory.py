@@ -4,7 +4,7 @@ import time
 import logging
 import threading
 from collections import deque
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 from refatored.config import (
     CONVERSATION_HISTORY_TURNS,
@@ -13,14 +13,15 @@ from refatored.config import (
 
 logger = logging.getLogger(__name__)
 
-# Frases curtas de encerramento educado durante o modo de conversa contínua (follow-up)
+# Frases curtas de encerramento/recusa educada durante o modo de conversa contínua (follow-up)
 _RE_DISMISSAL = re.compile(
-    r"^\s*(?:n[ãa]o\s*,?\s*)?"
-    r"(?:muito\s+)?"
-    r"(?:obrigad[oa]|valeu|brigad[oa]|s[óo]\s+isso|era\s+s[óo]\s+isso|"
+    r"^\s*(?:"
+    r"n[ãa]o|n[ãa]o\s+precisa|agora\s+n[ãa]o|deixa\s+assim(?:\s+mesmo)?|"
+    r"deixa\s+quieto|deixa\s+aces[oa]|deixa\s+ligad[oa]|deixa\s+apagad[oa]|deixa\s+desligad[oa]|pode\s+deixar(?:\s+assim)?|"
+    r"(?:n[ãa]o\s*,?\s*)?(?:muito\s+)?(?:obrigad[oa]|valeu|brigad[oa]|s[óo]\s+isso|era\s+s[óo]\s+isso|"
     r"por\s+enquanto\s+[ée]\s+s[óo]|nada\s+n[ãa]o|t[áa]\s+[óo]timo|t[áa]\s+bom|"
-    r"beleza\s*,?\s*obrigad[oa]|tchau|at[ée]\s+mais|at[ée]\s+logo|pode\s+parar|encerrar)"
-    r"\s*[.!]*\s*$",
+    r"beleza(?:\s*,?\s*obrigad[oa])?|tchau|at[ée]\s+mais|at[ée]\s+logo|pode\s+parar|encerrar)"
+    r")\s*[.!]*\s*$",
     re.IGNORECASE,
 )
 
@@ -77,6 +78,8 @@ class ConversationMemory:
         self._messages: deque[Dict[str, str]] = deque(maxlen=self._max_turns * 2)
         self._last_interaction_ts: float = 0.0
         self._last_ha_target: Optional[str] = None
+        self._last_ha_state: Optional[str] = None
+        self._last_ha_targets_list: List[str] = []
         self._last_ha_ts: float = 0.0
 
     def _expire_if_needed(self, now: Optional[float] = None) -> None:
@@ -90,11 +93,13 @@ class ConversationMemory:
             self._messages.clear()
 
         if (
-            self._last_ha_target
+            (self._last_ha_target or self._last_ha_targets_list)
             and self._last_ha_ts > 0
             and (current - self._last_ha_ts) > self._ttl_seconds
         ):
             self._last_ha_target = None
+            self._last_ha_state = None
+            self._last_ha_targets_list = []
 
     def clear(self) -> None:
         """Limpa imediatamente histórico conversacional e referência de dispositivo."""
@@ -102,6 +107,8 @@ class ConversationMemory:
             self._messages.clear()
             self._last_interaction_ts = 0.0
             self._last_ha_target = None
+            self._last_ha_state = None
+            self._last_ha_targets_list = []
             self._last_ha_ts = 0.0
 
     def add_turn(self, user_message: str, assistant_message: str) -> None:
@@ -121,13 +128,35 @@ class ConversationMemory:
             self._expire_if_needed()
             return list(self._messages)
 
-    def record_ha_target(self, target_name: str) -> None:
-        """Salva o último dispositivo canônico do Home Assistant acionado recentemente."""
+    def record_ha_target(
+        self,
+        target_name: str,
+        state: Optional[str] = None,
+    ) -> None:
+        """Salva o último dispositivo canônico do HA consultado ou acionado recentemente."""
         if not target_name:
             return
         with self._lock:
             now = time.monotonic()
             self._last_ha_target = target_name.strip().lower()
+            if state is not None:
+                self._last_ha_state = state.strip().lower()
+            self._last_ha_targets_list = [self._last_ha_target]
+            self._last_ha_ts = now
+            self._last_interaction_ts = now
+
+    def record_ha_targets_list(
+        self,
+        targets: List[str],
+        state: Optional[str] = "on",
+    ) -> None:
+        """Salva múltiplos dispositivos observados em uma conferência geral de estado."""
+        limpos = [t.strip().lower() for t in targets if t and t.strip()]
+        with self._lock:
+            now = time.monotonic()
+            self._last_ha_targets_list = limpos
+            self._last_ha_target = limpos[0] if len(limpos) == 1 else (limpos[-1] if limpos else None)
+            self._last_ha_state = state.strip().lower() if state else None
             self._last_ha_ts = now
             self._last_interaction_ts = now
 
@@ -137,11 +166,22 @@ class ConversationMemory:
             self._expire_if_needed()
             return self._last_ha_target
 
+    def get_last_ha_context(self) -> Tuple[Optional[str], Optional[str], List[str]]:
+        """Retorna (ultimo_dispositivo, ultimo_estado_observado, lista_dispositivos_recentes)."""
+        with self._lock:
+            self._expire_if_needed()
+            return (
+                self._last_ha_target,
+                self._last_ha_state,
+                list(self._last_ha_targets_list),
+            )
+
     def build_messages(
         self,
         static_system_prompt: str,
         user_message: str,
         rag_facts: Optional[List[str]] = None,
+        ha_context_hint: Optional[str] = None,
     ) -> List[Dict[str, str]]:
         """
         Constrói o array OpenAI Chat Completions mantendo o system_prompt estático
@@ -153,19 +193,25 @@ class ConversationMemory:
         ]
         messages.extend(history)
 
+        blocos_dinamicos: List[str] = []
         if rag_facts:
             linhas = "\n".join(f"- {fato}" for fato in rag_facts if fato)
             if linhas:
-                messages.append(
-                    {
-                        "role": "system",
-                        "content": (
-                            "Memórias e informações pessoais registradas na casa relevantes "
-                            "para apoiar sua resposta caso o usuário esteja perguntando sobre elas:\n"
-                            f"{linhas}"
-                        ),
-                    }
+                blocos_dinamicos.append(
+                    "Memórias e informações pessoais registradas na casa relevantes "
+                    "para apoiar sua resposta caso o usuário esteja perguntando sobre elas:\n"
+                    f"{linhas}"
                 )
+        if ha_context_hint:
+            blocos_dinamicos.append(ha_context_hint)
+
+        if blocos_dinamicos:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": "\n\n".join(blocos_dinamicos),
+                }
+            )
 
         messages.append({"role": "user", "content": user_message})
         return messages

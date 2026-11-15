@@ -89,9 +89,9 @@ Regras estritas:
 PROMPT_CLASSIFICADOR = """Você é um classificador de intenção rápido para um assistente doméstico.
 Analise a mensagem do usuário e responda com EXATAMENTE UMA palavra entre as três opções abaixo:
 
-- "home_assistant" -> Se for comando para controlar a casa (ligar, desligar, acender, apagar luzes, ar condicionado, TV ou automações).
-- "music" -> Se for comando relacionado a música (tocar música, parar música, próxima faixa, som, etc.).
-- "conversation" -> Se for pergunta geral, curiosidade, bate-papo, piada, etc.
+- "home_assistant" -> SOMENTE se for uma ordem direta e imediata para acionar um equipamento da casa AGORA (ex: ligar, desligar, acender, apagar luzes, ar condicionado, TV ou automações imediatamente).
+- "music" -> SOMENTE se for comando direto para o player de música (tocar música, parar música, próxima faixa, modo contínuo).
+- "conversation" -> Perguntas em geral, curiosidades, bate-papo, pedidos para lembrar/guardar/anotar/esquecer ou consultar memórias, recados, compromissos e horários (mesmo que citem ações como ligar/desligar, ex: "me lembra que tenho que desligar o forno"), timers/alarmes, perguntas se algo está aceso/ligado ou comandos condicionais ("se estiver calor, liga o ar").
 
 Responda SOMENTE: home_assistant, music ou conversation.
 """

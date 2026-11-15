@@ -9,6 +9,7 @@ except ImportError:
     requests = None
 
 from refatored.config import HA_URL, HEADERS_HA, HA_TIMEOUT, sanitize_for_log
+from refatored.conversation_memory import conversation_memory
 
 logger = logging.getLogger(__name__)
 
@@ -231,8 +232,25 @@ _RE_ANAPHORA_PRONOUN = re.compile(
     r"\b(ela|ele|isso|mesma|mesmo|de\s+novo|novamente)\b",
     re.IGNORECASE,
 )
+_RE_ANAPHORA_PLURAL = re.compile(
+    r"^(?:ent[aã]o\s+|agora\s+)?(?:pode\s+)?(?:desligar|apagar|ligar|acender|desliga|apaga|liga|acende)"
+    r"\s+(?:elas|eles|todas(?:\s+elas)?|tudo)(?:\s+por\s+favor|\s+pra\s+mim)?$",
+    re.IGNORECASE,
+)
+_RE_PURE_CONTEXTUAL_ACTION = re.compile(
+    r"^(?:sim\s+|isso\s+|ent[aã]o\s+|agora\s+|a[ií]\s+)*(?:pode\s+)?"
+    r"(?:ligar|desligar|acender|apagar|liga|desliga|acende|apaga|alternar|inverter)"
+    r"(?:\s+(?:ela|ele|isso|l[aá]|a[ií]|pra\s+mim|por\s+favor|ent[aã]o|de\s+novo|novamente))*$",
+    re.IGNORECASE,
+)
 _RE_NON_HA_OBJECT = re.compile(
-    r"\b(musica|som|faixa|timer|cronometro|alarme|lembrete|memoria)\b",
+    r"\b(musica|som|faixa|timer|cronometro|alarme|lembrete|memoria|forno|panela|fogao)\b",
+    re.IGNORECASE,
+)
+_RE_NOT_DIRECT_ACTUATION = re.compile(
+    r"\b(lembr(?:a|ar|e)|esquec(?:e|er|a)|memoriz|anot(?:a|ar|e)|guard(?:a|ar|e)|"
+    r"tenho\s+que|tinha\s+que|preciso\s+(?:ligar|desligar|apagar|acender)|"
+    r"que\s+horas|quando\s+eu|se\s+(?:tiver|estiver|fizer|passar))\b",
     re.IGNORECASE,
 )
 _RE_COMPOUND_SPLIT = re.compile(
@@ -278,6 +296,11 @@ def parse_home_assistant_local(
         logger.warning(f"Comando com negação detectado: '{mensagem}'. Ignorando por segurança.")
         return {"error": "negation_detected"}
 
+    # 1.b. Ignorar frases de lembrete, obrigação futura, pergunta de horário ou condicional
+    #      (ex: 'me lembra que tenho que desligar o forno' ou 'se estiver calor liga o ar')
+    if _RE_NOT_DIRECT_ACTUATION.search(texto) or mensagem.strip().endswith("?"):
+        return None
+
     # 2. Identificar ação com prioridade para DESLIGAR e com limites de palavra (\b)
     action = None
     if RE_DESLIGAR.search(texto):
@@ -299,17 +322,16 @@ def parse_home_assistant_local(
     # 3. Identificar dispositivo ou automação
     target_name = _match_target_device(texto)
 
-    # 4. Resolução anafórica contextual ("agora apaga ela", "desliga isso")
+    # 4. Resolução anafórica contextual ("acende/apaga ela", "pode apagar por favor")
+    #    Exige que não haja objeto estranho ('forno', 'música') e que a frase seja uma ação
+    #    contextual pura ou contenha pronome anafórico explícito.
     if (
         not target_name
         and last_target
         and last_target in DEVICE_REGISTRY
         and action is not None
         and not _RE_NON_HA_OBJECT.search(texto)
-        and (
-            _RE_ANAPHORA_PRONOUN.search(texto)
-            or len(texto.split()) <= 2
-        )
+        and _RE_PURE_CONTEXTUAL_ACTION.match(texto)
     ):
         if last_target in ("ligar ar condicionado", "desligar ar condicionado"):
             ar_target = (
@@ -346,10 +368,12 @@ def parse_home_assistant_local(
 def parse_home_assistant_multi_local(
     mensagem: str,
     last_target: Optional[str] = None,
+    last_targets_list: Optional[List[str]] = None,
 ) -> Optional[List[Dict[str, Any]]]:
     """
     Parser determinístico local com suporte a múltiplos comandos na mesma frase
-    (ex: 'apaga a luz da sala e liga o ar condicionado' ou 'apaga a luz da sala e a luz da varanda').
+    (ex: 'apaga a luz da sala e liga o ar condicionado' ou 'apaga a luz da sala e a luz da varanda'),
+    além de anáfora plural ('apaga elas') após consultar vários dispositivos ligados.
     Retorna lista de intenções ou None se nenhum comando HA determinístico for detectado.
     """
     if not mensagem:
@@ -359,6 +383,22 @@ def parse_home_assistant_multi_local(
     if RE_NEGACAO.search(texto_inteiro):
         logger.warning(f"Comando composto com negação detectado: '{mensagem}'. Ignorando.")
         return [{"error": "negation_detected"}]
+
+    if _RE_NOT_DIRECT_ACTUATION.search(texto_inteiro) or mensagem.strip().endswith("?"):
+        return None
+
+    # Anáfora plural ("apaga elas", "desliga todas") após listar dispositivos ligados
+    if (
+        last_targets_list
+        and len(last_targets_list) >= 2
+        and _RE_ANAPHORA_PLURAL.match(texto_inteiro)
+    ):
+        acao_plural = "turn_off" if RE_DESLIGAR.search(texto_inteiro) else "turn_on"
+        return [
+            {"action": acao_plural, "target_name": alvo, "parameters": {}}
+            for alvo in last_targets_list
+            if alvo in DEVICE_REGISTRY
+        ]
 
     partes = [p.strip() for p in _RE_COMPOUND_SPLIT.split(mensagem) if p and p.strip()]
     if len(partes) >= 2:
@@ -754,13 +794,25 @@ def consultar_estado_dispositivo_ha(nome_dispositivo: str) -> str:
         eh_luz = canonico.startswith("luz")
 
         if state in ("on", "playing", "idle", "paused"):
+            conversation_memory.record_ha_target(canonico, state="on")
             estado_fala = "acesa" if eh_luz else "ligada"
-            return f"Dei uma olhada aqui e a {canonico} tá {estado_fala} nesse momento."
+            verbo_oposto = "apague" if eh_luz else "desligue"
+            return (
+                f"Dei uma olhada aqui e a {canonico} tá {estado_fala} "
+                f"— quer que eu {verbo_oposto}?"
+            )
         elif state in ("off", "standby"):
+            conversation_memory.record_ha_target(canonico, state="off")
             estado_fala = "apagada" if eh_luz else "desligada"
-            return f"Conferi aqui: a {canonico} tá {estado_fala}."
+            verbo_oposto = "acenda" if eh_luz else "ligue"
+            return (
+                f"Conferi aqui: a {canonico} tá {estado_fala} "
+                f"— quer que eu {verbo_oposto}?"
+            )
         elif state in ("unavailable", "unknown"):
+            conversation_memory.record_ha_target(canonico, state=state)
             return f"Olha, a {canonico} aparece como indisponível ou sem sinal no Home Assistant agora."
+        conversation_memory.record_ha_target(canonico, state=state)
         return f"O estado atual de {canonico} no Home Assistant é {state}."
     except Exception as e:
         logger.error(f"Erro ao consultar estado de {entity_id}: {e}")
@@ -801,10 +853,14 @@ def listar_dispositivos_ligados_ha() -> str:
 
         if not ligados:
             return "Dei uma geral aqui e tá tudo desligado em casa no momento."
+
+        conversation_memory.record_ha_targets_list(ligados, state="on")
         if len(ligados) == 1:
-            return f"Olha, no momento só a {ligados[0]} tá ligada."
+            eh_luz = ligados[0].startswith("luz")
+            verbo = "apague" if eh_luz else "desligue"
+            return f"Olha, no momento só a {ligados[0]} tá ligada — quer que eu {verbo} ela?"
         lista_txt = ", ".join(ligados[:-1]) + f" e {ligados[-1]}"
-        return f"Conferi aqui em casa e estão ligadas: {lista_txt}."
+        return f"Conferi aqui em casa e estão ligadas: {lista_txt} — quer que eu desligue elas?"
     except Exception as e:
         logger.error(f"Erro ao listar estados do Home Assistant: {e}")
         return "Não consegui verificar os dispositivos do Home Assistant no momento."

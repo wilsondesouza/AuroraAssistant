@@ -26,50 +26,85 @@ from refatored.config import (
 
 logger = logging.getLogger(__name__)
 
-# Stopwords comuns em português para filtragem de palavras-chave de busca
+# Stopwords comuns em português + palavras meta de memória para filtragem de busca/exclusão
 _STOPWORDS_PT = {
     "a", "as", "o", "os", "um", "uma", "uns", "umas", "de", "do", "da", "dos", "das",
     "em", "no", "na", "nos", "nas", "por", "para", "pra", "pro", "com", "sem", "que",
     "qual", "quais", "quem", "onde", "como", "quando", "quanto", "quantos", "foi",
     "era", "ser", "estar", "esta", "está", "tá", "ta", "sao", "são", "tem", "ter",
+    "tenho", "tinha", "preciso", "precisa",
     "eu", "voce", "você", "ele", "ela", "eles", "elas", "meu", "minha", "meus",
     "minhas", "seu", "sua", "seus", "suas", "isso", "isto", "aquilo", "aurora",
+    "esse", "essa", "este", "esta", "aquele", "aquela",
     "me", "te", "se", "lhe", "ai", "aí", "la", "lá", "aqui", "mesmo", "sobre",
-    "sabe", "lembra", "dizer", "fala", "falar", "conta", "contar", "favor",
+    "sabe", "lembra", "lembrar", "lembre", "lembrete", "lembretes",
+    "memoria", "memorias", "nota", "notas", "recado", "recados", "informacao",
+    "dizer", "fala", "falar", "conta", "contar", "favor", "pode", "poderia",
 }
 
-# Padrões determinísticos locais para gerenciar a Memória da Casa por voz
+# Prefixos naturais da fala coloquial antes do verbo de memória
+_OPT_PREFIX = (
+    r"^\s*(?:(?:ei|oi|olha(?:\s+s[óo])?|escuta)\s*,?\s*)?"
+    r"(?:aurora\s*,?\s*)?"
+    r"(?:por\s+favor\s*,?\s*)?"
+    r"(?:(?:voc[êe]\s+)?pode(?:ria)?\s+|faz\s+um\s+favor\s*,?\s*|quero\s+que\s+(?:voc[êe]\s+)?)?"
+)
+
+# Padrões naturais ricos em português brasileiro para SALVAR na Memória da Casa
+# (Evita capturar perguntas como "lembra qual é..." ou timers relativos "daqui a 5 min")
 _RE_MEMORY_SAVE = re.compile(
-    r"^\s*(?:aurora\s*,?\s*)?(?:por\s+favor\s*,?\s*)?"
-    r"(?:lembra(?:\s+pra\s+mim)?\s+que|lembre(?:\s+que)?|"
-    r"guarda(?:\s+a[íi])?(?:\s+na\s+mem[óo]ria)?\s*(?:que|:)?|"
-    r"memoriza(?:\s+a[íi])?\s*(?:que|:)?|"
-    r"salva\s+na\s+mem[óo]ria\s*(?:que|:)?|"
-    r"anota\s+a[íi]\s*(?:na\s+mem[óo]ria)?\s*(?:que|:)?)\s+(.+)$",
+    _OPT_PREFIX
+    + r"(?:"
+    r"(?:me\s+)?lembr(?:a|ar|e)(?:-me)?(?:\s+pra\s+mim|\s+a[íi])?\s+(?:que|de)\b|"
+    r"n[ãa]o\s+(?:me\s+)?deix(?:a|e)(?:\s+eu)?\s+esquecer\s+(?:que|de)\b|"
+    r"n[ãa]o\s+quero\s+esquecer\s+(?:que|de)\b|"
+    r"(?:me\s+)?ajuda\s+a\s+lembrar\s+(?:que|de)\b|"
+    r"guard(?:a|ar|e)(?:\s+a[íi]|\s+pra\s+mim|\s+isso)?(?:\s+na\s+mem[óo]ria)?\s*(?:que|:)?|"
+    r"memoriz(?:a|ar|e)(?:\s+a[íi]|\s+pra\s+mim|\s+isso)?\s*(?:que|:)?|"
+    r"salv(?:a|ar|e)(?:\s+a[íi]|\s+pra\s+mim)?\s+na\s+mem[óo]ria\s*(?:que|:)?|"
+    r"grav(?:a|ar|e)(?:\s+a[íi]|\s+pra\s+mim)?(?:\s+na\s+mem[óo]ria)?\s*(?:que|:)?|"
+    r"registr(?:a|ar|e)(?:\s+a[íi]|\s+pra\s+mim)?(?:\s+na\s+mem[óo]ria)?\s*(?:que|:)?|"
+    r"anot(?:a|ar|e)(?:\s+a[íi]|\s+pra\s+mim)?(?:\s+na\s+mem[óo]ria)?\s*(?:que|:)?"
+    r")\s*"
+    r"(?!(?:qual|quais|onde|como|quando|quem|que\s+horas|que\s+dia|se)\b)"
+    r"(?!(?:daqui\s+a|em)\s+\d+\s*(?:segundos?|minutos?|horas?)\b)"
+    r"(.+)$",
     re.IGNORECASE,
 )
 
 _RE_MEMORY_FORGET = re.compile(
-    r"^\s*(?:aurora\s*,?\s*)?(?:por\s+favor\s*,?\s*)?"
-    r"(?:esquece|esque[çc]a|apaga\s+da\s+mem[óo]ria|remove\s+da\s+mem[óo]ria|"
-    r"deleta\s+da\s+mem[óo]ria)\s+(?:a\s+nota\s+sobre\s+|a\s+mem[óo]ria\s+sobre\s+|sobre\s+|que\s+)?(.+)$",
+    _OPT_PREFIX
+    + r"(?:"
+    r"esquec(?:e|er|a)\s+(?:(?:aquel[ea]|ess[ea]|o|a)\s+)?(?:(?:nota|mem[óo]ria|lembrete|recado|informa[çc][ãa]o)\s+)?|"
+    r"(?:apag(?:a|ar|ue)|remov(?:a|e|er)|delet(?:a|ar|e))\s+(?:da\s+mem[óo]ria\s+|(?:(?:aquel[ea]|ess[ea]|o|a)\s+)?(?:nota|mem[óo]ria|lembrete|recado|informa[çc][ãa]o)\s+)"
+    r")"
+    r"(?:sobre\s+|do\s+|da\s+|de\s+|que\s+)?"
+    r"(.+)$",
     re.IGNORECASE,
 )
 
 _RE_MEMORY_LIST = re.compile(
-    r"\b(?:o\s+que\s+(?:voc[êe]\s+)?tem\s+(?:salvo\s+)?na\s+mem[óo]ria|"
-    r"quais\s+(?:s[ãa]o\s+as\s+)?mem[óo]rias\s+salvas|"
-    r"listar?\s+(?:as\s+)?mem[óo]rias|o\s+que\s+voc[êe]\s+guardou\s+na\s+mem[óo]ria)\b",
+    r"\b(?:o\s+que\s+(?:voc[êe]\s+)?tem\s+(?:salvo\s+|guardado\s+)?na\s+mem[óo]ria|"
+    r"quais\s+(?:s[ãa]o\s+)?(?:as\s+|os\s+)?(?:mem[óo]rias|lembretes|notas|recados)(?:\s+salv[oa]s?)?|"
+    r"listar?\s+(?:as\s+|os\s+)?(?:mem[óo]rias|lembretes|notas)|"
+    r"o\s+que\s+(?:voc[êe]\s+guardou|eu\s+pedi\s+pra\s+(?:voc[êe]\s+)?(?:lembrar|guardar|anotar))|"
+    r"tem\s+algum(?:a)?\s+(?:lembrete|mem[óo]ria|nota|recado)\s+(?:salv[oa]|guardad[oa]|pra\s+mim))\b",
     re.IGNORECASE,
 )
 
 
 def _strip_accents(text: str) -> str:
-    """Remove acentos e converte para minúsculas para indexação tolerante a transcrição."""
+    """
+    Remove acentos, converte para minúsculas e padroniza horários compactos ('04h' -> '4 horas')
+    para indexação tolerante a variações de fala e transcrição.
+    """
     if not text:
         return ""
     nfkd = unicodedata.normalize("NFKD", text.lower())
-    return "".join(ch for ch in nfkd if not unicodedata.combining(ch))
+    sem_acento = "".join(ch for ch in nfkd if not unicodedata.combining(ch))
+    # Padronizar '04h' / '4h' -> '4 horas' no índice de busca para casar '4 horas' com '04h'
+    sem_acento = re.sub(r"\b0*(\d{1,2})h(\d{2})?\b", lambda m: f"{int(m.group(1))} horas {m.group(2) or ''}".strip(), sem_acento)
+    return sem_acento
 
 
 def _extract_keywords(text: str) -> List[str]:
@@ -404,13 +439,14 @@ def handle_memory_command_local(
     target_store = store or memory_store
     texto = mensagem.strip()
 
-    # 1. Salvar fato na memória
-    m_save = _RE_MEMORY_SAVE.match(texto)
-    if m_save:
-        fato = m_save.group(1).strip().rstrip(".!?")
-        if len(fato) >= 3:
-            target_store.add_memory(fato)
-            return f"Pode deixar, já guardei na memória: {fato}."
+    # 1. Salvar fato na memória (apenas afirmações/pedidos, nunca perguntas com '?')
+    if not texto.endswith("?"):
+        m_save = _RE_MEMORY_SAVE.match(texto)
+        if m_save:
+            fato = m_save.group(1).strip().rstrip(".!")
+            if len(fato) >= 3:
+                target_store.add_memory(fato)
+                return f"Pode deixar, já guardei na memória: {fato}."
 
     # 2. Esquecer / apagar memória
     m_forget = _RE_MEMORY_FORGET.match(texto)

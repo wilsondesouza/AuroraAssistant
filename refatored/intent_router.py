@@ -52,18 +52,37 @@ logger = logging.getLogger(__name__)
 # economizando ~650 tokens de schema em conversas casuais e preservando o streaming de voz!
 _RE_HYBRID_TOOL_HINT = re.compile(
     r"\b(?:clima|tempo|temperatura|chover|calor|frio|graus|horas?|hor[áa]rio|"
-    r"luz(?:es)?|tv|televis[ãa]o|ar[\s-]?condicionado|sala|quarto|varanda|garagem|banheiro|"
+    r"luz(?:es)?|tv|televis[ãa]o|ar[\s-]?condicionado|sala|quarto|varanda|garagem|banheiro|[áa]rea|"
     r"ligad[oa]s?|aces[oa]s?|desligad[oa]s?|apagad[oa]s?|liga(?:r)?|desliga(?:r)?|acende(?:r)?|apaga(?:r)?|"
     r"m[úu]sica|tocando|faixa|som|timer|cron[ôo]metro|alarme|avisa(?:r)?|daqui\s+a|"
-    r"lembra(?:r)?|mem[óo]ria|guarda(?:r)?|anota(?:r)?|salva(?:r)?|senha|rem[ée]dio)\b",
+    r"lembr(?:a|ar|e|ete)|esquec(?:e|er|a)|mem[óo]ria|guard(?:a|ar|e|ei)|anot(?:a|ar|e)|"
+    r"salv(?:a|ar|e)|grav(?:a|ar|e)|registr(?:a|ar|e)|nota|recado|senha|rem[ée]dio|forno|panela)\b",
+    re.IGNORECASE,
+)
+
+# Confirmações ou referências curtas logo após conferir estado de um dispositivo ("quero sim", "pode fazer isso")
+_RE_CONTEXTUAL_HA_FOLLOWUP = re.compile(
+    r"\b(?:sim|quero|pode|por\s+favor|isso|faz|fa[çc]a|inverte|inverter|contr[áa]rio|"
+    r"ela|ele|elas|eles|todas|tudo)\b",
+    re.IGNORECASE,
+)
+
+# Nuances de memória, obrigação futura, timer ou pergunta que NUNCA devem morrer em 'unknown_device' do HA
+_RE_NUANCED_MEMORY_OR_CHAT = re.compile(
+    r"\b(?:lembr|esquec|mem[óo]ria|guard|anot|grav|registr|salv|avisa|timer|alarme|"
+    r"tenho\s+que|tinha\s+que|preciso|forno|panela|rem[ée]dio|senha|onde|quando|qual|como)\b|\?",
     re.IGNORECASE,
 )
 
 
-def _may_require_tools(mensagem: str) -> bool:
+def _may_require_tools(mensagem: str, has_recent_ha_context: bool = False) -> bool:
     if not mensagem:
         return False
-    return bool(_RE_HYBRID_TOOL_HINT.search(mensagem))
+    if _RE_HYBRID_TOOL_HINT.search(mensagem):
+        return True
+    if has_recent_ha_context and len(mensagem.split()) <= 8 and _RE_CONTEXTUAL_HA_FOLLOWUP.search(mensagem):
+        return True
+    return False
 
 
 # ==========================================
@@ -181,11 +200,21 @@ class IntentRouter:
     def _executar_comandos_ha_validados(
         self, comandos: List[Dict[str, Any]]
     ) -> Tuple[bool, str]:
-        """Executa 1 ou múltiplos comandos HA registrando o último alvo na memória curta."""
+        """Executa 1 ou múltiplos comandos HA registrando o último alvo e estado na memória curta."""
+        def _inferred_state(service: Optional[str]) -> Optional[str]:
+            if service == "turn_on":
+                return "on"
+            if service == "turn_off":
+                return "off"
+            return None
+
         if len(comandos) == 1:
             sucesso, msg_ha = executar_comando_ha(comandos[0])
             if sucesso and comandos[0].get("target_name"):
-                conversation_memory.record_ha_target(comandos[0]["target_name"])
+                conversation_memory.record_ha_target(
+                    comandos[0]["target_name"],
+                    state=_inferred_state(comandos[0].get("service")),
+                )
             return sucesso, msg_ha
 
         sucessos = 0
@@ -195,7 +224,10 @@ class IntentRouter:
             if ok:
                 sucessos += 1
                 if cmd.get("target_name"):
-                    conversation_memory.record_ha_target(cmd["target_name"])
+                    conversation_memory.record_ha_target(
+                        cmd["target_name"],
+                        state=_inferred_state(cmd.get("service")),
+                    )
             else:
                 ultimo_erro = msg
 
@@ -310,7 +342,7 @@ class IntentRouter:
                 "expect_followup": False,
             }
 
-        # 1.6. Consulta de Estado no Home Assistant ("a luz da sala tá acesa?", "tem luz ligada?")
+        # 1.6. Consulta de Estado no Home Assistant ("a área tá acesa?", "tem luz ligada?")
         resp_estado_ha = parse_ha_state_query_local(mensagem)
         if resp_estado_ha:
             logger.info("Intenção local detectada: CONSULTA ESTADO HA")
@@ -321,17 +353,19 @@ class IntentRouter:
                 "intent": "home_assistant_state",
                 "success": True,
                 "message": resp_estado_ha,
-                "expect_followup": False,
+                "expect_followup": should_expect_followup(resp_estado_ha),
             }
 
-        # 1.7. Parser local de Home Assistant (Simples, Multi-comando e Anafórico)
-        ultimo_alvo_ha = conversation_memory.get_last_ha_target()
+        # 1.7. Parser local de Home Assistant (Simples, Multi-comando e Anafórico Singular/Plural)
+        ultimo_alvo_ha, _, ultimos_alvos_lista = conversation_memory.get_last_ha_context()
         if parse_home_assistant_local is not _DEFAULT_PARSE_HA_LOCAL:
             unico_mock = parse_home_assistant_local(mensagem)
             intencoes_ha_locais = [unico_mock] if unico_mock else None
         else:
             intencoes_ha_locais = parse_home_assistant_multi_local(
-                mensagem, last_target=ultimo_alvo_ha
+                mensagem,
+                last_target=ultimo_alvo_ha,
+                last_targets_list=ultimos_alvos_lista,
             )
 
         if intencoes_ha_locais:
@@ -394,6 +428,20 @@ class IntentRouter:
         if modo == "home_assistant":
             intencao_llm = extrair_intencao_ha_llm(mensagem)
             comandos = resolver_lista_comandos(intencao_llm)
+
+            # Rede de segurança: se o classificador confundiu um pedido de memória/recado/pergunta
+            # com home_assistant (ex: por conter a palavra 'desligar' em 'desligar o forno') e deu
+            # unknown_device, redireciona de forma transparente para a conversa com Tools e Mini-RAG!
+            if (
+                all(c.get("error") == "unknown_device" for c in comandos)
+                and _RE_NUANCED_MEMORY_OR_CHAT.search(mensagem)
+            ):
+                logger.info(
+                    "Dispositivo desconhecido em frase com nuance de memória/conversa; "
+                    "redirecionando para LLM com Tools e Mini-RAG..."
+                )
+                return self._processar_conversa_llm(mensagem, force_tools=True)
+
             sucesso, msg_ha = self._executar_comandos_ha_validados(comandos)
             if sucesso:
                 play_confirmation()
@@ -417,7 +465,11 @@ class IntentRouter:
             # Modo conversa inteligente (com Memória Curta + Mini-RAG SQLite + Tools + Streaming TTS)
             return self._processar_conversa_llm(mensagem)
 
-    def _processar_conversa_llm(self, mensagem: str) -> Dict[str, Any]:
+    def _processar_conversa_llm(
+        self,
+        mensagem: str,
+        force_tools: bool = False,
+    ) -> Dict[str, Any]:
         """Executa o fluxo de conversa enriquecido com contexto, RAG doméstico, Tools e Streaming."""
         logger.info("Executando fluxo de conversa com LLM...")
 
@@ -426,11 +478,37 @@ class IntentRouter:
         if fatos_relevantes:
             logger.info(f"Mini-RAG injetou {len(fatos_relevantes)} memória(s) da casa no contexto.")
 
-        # 2. Montar mensagens mantendo PROMPT_CONVERSA fixo na posição 0 (Prompt Caching friendly)
+        # 2. Verificar se há contexto recente de conferência/acionamento de dispositivo HA
+        ultimo_alvo_ha, ultimo_estado_ha, ultimos_alvos_lista = (
+            conversation_memory.get_last_ha_context()
+        )
+        precisa_tools = force_tools or _may_require_tools(
+            mensagem, has_recent_ha_context=bool(ultimo_alvo_ha)
+        )
+
+        ha_hint: Optional[str] = None
+        if precisa_tools and ultimo_alvo_ha:
+            alvos_txt = (
+                ", ".join(ultimos_alvos_lista)
+                if len(ultimos_alvos_lista) > 1
+                else ultimo_alvo_ha
+            )
+            estado_txt = f" (último estado observado: {ultimo_estado_ha})" if ultimo_estado_ha else ""
+            ha_hint = (
+                f"Contexto recente da casa: dispositivo(s) em foco na interação anterior: "
+                f"{alvos_txt}{estado_txt}. Se a mensagem atual do usuário confirmar ou pedir "
+                f"uma ação sobre esse(s) dispositivo(s) (ex: 'sim', 'quero', 'pode apagar', "
+                f"'acende ela', 'inverte'), execute controlar_dispositivo_casa. Se o usuário "
+                f"mudou de assunto e não há relação com o dispositivo, ignore este aviso e "
+                f"responda normalmente."
+            )
+
+        # 3. Montar mensagens mantendo PROMPT_CONVERSA fixo na posição 0 (Prompt Caching friendly)
         messages = conversation_memory.build_messages(
             static_system_prompt=PROMPT_CONVERSA,
             user_message=mensagem,
             rag_facts=fatos_relevantes,
+            ha_context_hint=ha_hint,
         )
 
         # Compatibilidade total caso chamar_modelo tenha sido substituído por mock em testes:
@@ -461,8 +539,8 @@ class IntentRouter:
             else LLM_STREAM_TTS
         )
 
-        # 3a. Se a mensagem sugerir ação híbrida (clima + casa, timer, memória, status), usa Tool Calling (max_steps<=2)
-        if use_tools and _may_require_tools(mensagem):
+        # 4a. Se a mensagem sugerir ação híbrida ou confirmação pós-consulta de estado HA, usa Tool Calling (max_steps<=2)
+        if use_tools and precisa_tools:
             resposta, _ = llm_client.chamar_com_tools(
                 modelo=MODEL_CONVERSA,
                 messages=messages,

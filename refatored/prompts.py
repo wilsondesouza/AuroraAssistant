@@ -57,12 +57,21 @@ def get_prompt_conversa(style: str | None = None) -> str:
 PROMPT_CONVERSA = get_prompt_conversa()
 
 PROMPT_HA = """Você é um extrator de intenção para automação residencial do Home Assistant.
-Converta o comando do usuário em um JSON estrito no seguinte formato:
+Converta o comando do usuário em um JSON estrito.
 
+Para UM único comando, use este formato:
 {
   "action": "turn_on | turn_off | toggle | set_brightness | trigger",
   "target_name": "nome do dispositivo ou automação",
   "parameters": {}
+}
+
+Se o usuário pedir DOIS OU MAIS comandos na mesma frase (ex: apagar uma luz e ligar o ar), use o formato em lote:
+{
+  "actions": [
+    {"action": "turn_off", "target_name": "luz da sala", "parameters": {}},
+    {"action": "trigger", "target_name": "ligar ar condicionado", "parameters": {}}
+  ]
 }
 
 Regras estritas:

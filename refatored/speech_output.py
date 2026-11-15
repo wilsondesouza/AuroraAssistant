@@ -1,13 +1,14 @@
 import os
 import re
 import sys
+import queue
 import logging
 import tempfile
 import subprocess
 import threading
 import shutil
 from contextlib import contextmanager
-from typing import Generator
+from typing import Generator, Iterable
 
 from refatored.config import (
     CONFIRMATION_SOUND,
@@ -352,6 +353,68 @@ class TextToSpeechManager:
                 )
                 play_falha_tts()
 
+    def falar_em_stream(
+        self,
+        frases_iter: Iterable[str],
+        provider_override: str | None = None,
+    ) -> str:
+        """
+        Pipeline produtor-consumidor de baixa latência (Sentence-Level Streaming):
+        Enquanto a frase N está tocando no alto-falante, uma thread em background já
+        sintetiza o áudio da frase N+1 no TTS, eliminando o silêncio entre frases
+        e mantendo o boost ALSA contínuo durante toda a resposta.
+        Retorna o texto completo concatenado que foi gerado.
+        """
+        fila_audio: queue.Queue = queue.Queue(maxsize=3)
+        frases_coletadas: list[str] = []
+
+        def _producer():
+            try:
+                for frase in frases_iter:
+                    trecho = (frase or "").strip()
+                    if not trecho:
+                        continue
+                    frases_coletadas.append(trecho)
+                    sintese = self.client.sintetizar(
+                        trecho, provider_override=provider_override
+                    )
+                    fila_audio.put((trecho, sintese))
+            except Exception as exc:
+                logger.error(f"Erro no produtor de streaming TTS: {exc}")
+            finally:
+                fila_audio.put(None)
+
+        worker = threading.Thread(target=_producer, daemon=True)
+        worker.start()
+
+        primeiro_item = fila_audio.get()
+        if primeiro_item is None:
+            worker.join(timeout=1.0)
+            return ""
+
+        falha_acionada = False
+        with _temporarily_boost_tts_volume():
+            item = primeiro_item
+            while item is not None:
+                _, sintese = item
+                ok = False
+                if sintese is not None:
+                    audio_bytes, ext, used_prov = sintese
+                    logger.debug(
+                        f"Streaming TTS reproduzindo trecho via [{used_prov.upper()}] ({ext})..."
+                    )
+                    ok = _play_synthesized_bytes(audio_bytes, ext=ext)
+                if not ok and not falha_acionada:
+                    logger.error(
+                        "Falha ao sintetizar/reproduzir trecho em streaming; tocando contingência."
+                    )
+                    play_falha_tts()
+                    falha_acionada = True
+                item = fila_audio.get()
+
+        worker.join(timeout=2.0)
+        return " ".join(frases_coletadas).strip()
+
 
 # Instância global singleton
 tts_manager = TextToSpeechManager()
@@ -360,3 +423,8 @@ tts_manager = TextToSpeechManager()
 def falar(texto: str):
     """Função utilitária global para fala da Aurora."""
     tts_manager.falar(texto)
+
+
+def falar_em_stream(frases_iter: Iterable[str]) -> str:
+    """Função utilitária global para fala em streaming por frases completas."""
+    return tts_manager.falar_em_stream(frases_iter)

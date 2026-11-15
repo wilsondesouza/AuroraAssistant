@@ -1,7 +1,7 @@
 import re
 import json
 import logging
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 
 try:
     import requests
@@ -227,16 +227,51 @@ def normalize_text(text: str) -> str:
     return text
 
 
-def parse_home_assistant_local(mensagem: str) -> Optional[Dict[str, Any]]:
+_RE_ANAPHORA_PRONOUN = re.compile(
+    r"\b(ela|ele|isso|mesma|mesmo|de\s+novo|novamente)\b",
+    re.IGNORECASE,
+)
+_RE_NON_HA_OBJECT = re.compile(
+    r"\b(musica|som|faixa|timer|cronometro|alarme|lembrete|memoria)\b",
+    re.IGNORECASE,
+)
+_RE_COMPOUND_SPLIT = re.compile(
+    r"\s*(?:,|;|\be\s+tamb[ée]m\b|\be\s+depois\b|\bdepois\b|\be\b)\s*",
+    re.IGNORECASE,
+)
+
+
+def _match_target_device(texto: str) -> Optional[str]:
+    """Localiza o nome canônico de um dispositivo ou alias no trecho normalizado."""
+    todos_dispositivos = sorted(DEVICE_REGISTRY.keys(), key=len, reverse=True)
+    for nome in todos_dispositivos:
+        if nome in texto:
+            return nome
+
+    for alias, canonico in sorted(DEVICE_ALIASES.items(), key=lambda kv: len(kv[0]), reverse=True):
+        if re.search(rf"\b{re.escape(alias)}\b", texto):
+            return canonico
+
+    return None
+
+
+def parse_home_assistant_local(
+    mensagem: str,
+    last_target: Optional[str] = None,
+    inherited_action: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """
     Parser determinístico local para comandos simples do Home Assistant.
-    Resolve o bug crítico onde 'desligar' continha 'ligar'.
+    Resolve o bug crítico onde 'desligar' continha 'ligar' e suporta anáfora
+    de curto prazo ('agora apaga ela') quando last_target está disponível.
     Retorna dicionário de intenção ou None se não identificado.
     """
     if not mensagem:
         return None
 
     texto = normalize_text(mensagem)
+    if not texto:
+        return None
 
     # 1. Se contiver negação ("não ligar a luz", "não desligar"), rejeita
     if RE_NEGACAO.search(texto):
@@ -251,31 +286,40 @@ def parse_home_assistant_local(mensagem: str) -> Optional[Dict[str, Any]]:
         action = "turn_on"
     elif RE_TOGGLE.search(texto):
         action = "toggle"
-
-    # 3. Identificar dispositivo ou automação
-    # Ordenar por tamanho decrescente do nome para casar 'luz do meu quarto' antes de 'luz do quarto'
-    todos_dispositivos = sorted(DEVICE_REGISTRY.keys(), key=len, reverse=True)
-    target_name = None
+    elif inherited_action:
+        action = inherited_action
 
     # Caso especial: ar condicionado ("ligar o ar condicionado" / "desligar o ar condicionado")
-    if "ar condicionado" in texto or "ar-condicionado" in texto or "ar" in texto.split():
+    if "ar condicionado" in texto or "ar" in texto.split():
         if action == "turn_off" or "desligar" in texto or "desliga" in texto:
             return {"action": "trigger", "target_name": "desligar ar condicionado", "parameters": {}}
         elif action == "turn_on" or "ligar" in texto or "liga" in texto:
             return {"action": "trigger", "target_name": "ligar ar condicionado", "parameters": {}}
 
-    # Checar nomes canônicos no registro
-    for nome in todos_dispositivos:
-        if nome in texto:
-            target_name = nome
-            break
+    # 3. Identificar dispositivo ou automação
+    target_name = _match_target_device(texto)
 
-    # Checar sinônimos se ainda não encontrado
-    if not target_name:
-        for alias, canonico in DEVICE_ALIASES.items():
-            if alias in texto:
-                target_name = canonico
-                break
+    # 4. Resolução anafórica contextual ("agora apaga ela", "desliga isso")
+    if (
+        not target_name
+        and last_target
+        and last_target in DEVICE_REGISTRY
+        and action is not None
+        and not _RE_NON_HA_OBJECT.search(texto)
+        and (
+            _RE_ANAPHORA_PRONOUN.search(texto)
+            or len(texto.split()) <= 2
+        )
+    ):
+        if last_target in ("ligar ar condicionado", "desligar ar condicionado"):
+            ar_target = (
+                "desligar ar condicionado"
+                if action == "turn_off"
+                else "ligar ar condicionado"
+            )
+            return {"action": "trigger", "target_name": ar_target, "parameters": {}}
+        target_name = last_target
+        logger.info(f"parse_local resolveu referência contextual para '{target_name}'")
 
     if not target_name:
         logger.debug(f"parse_local: nenhum dispositivo reconhecido em '{mensagem}'")
@@ -297,6 +341,59 @@ def parse_home_assistant_local(mensagem: str) -> Optional[Dict[str, Any]]:
         "target_name": target_name,
         "parameters": {}
     }
+
+
+def parse_home_assistant_multi_local(
+    mensagem: str,
+    last_target: Optional[str] = None,
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    Parser determinístico local com suporte a múltiplos comandos na mesma frase
+    (ex: 'apaga a luz da sala e liga o ar condicionado' ou 'apaga a luz da sala e a luz da varanda').
+    Retorna lista de intenções ou None se nenhum comando HA determinístico for detectado.
+    """
+    if not mensagem:
+        return None
+
+    texto_inteiro = normalize_text(mensagem)
+    if RE_NEGACAO.search(texto_inteiro):
+        logger.warning(f"Comando composto com negação detectado: '{mensagem}'. Ignorando.")
+        return [{"error": "negation_detected"}]
+
+    partes = [p.strip() for p in _RE_COMPOUND_SPLIT.split(mensagem) if p and p.strip()]
+    if len(partes) >= 2:
+        intencoes: List[Dict[str, Any]] = []
+        acao_herdada: Optional[str] = None
+        todos_validos = True
+
+        for parte in partes:
+            parsed = parse_home_assistant_local(
+                parte,
+                last_target=None,
+                inherited_action=acao_herdada,
+            )
+            if parsed and "error" not in parsed:
+                intencoes.append(parsed)
+                if parsed["action"] in ("turn_on", "turn_off", "toggle"):
+                    acao_herdada = parsed["action"]
+            else:
+                todos_validos = False
+                break
+
+        if todos_validos and len(intencoes) >= 2:
+            # Remover duplicatas exatas consecutivas preservando ordem
+            unicas: List[Dict[str, Any]] = []
+            vistas = set()
+            for item in intencoes:
+                chave = (item["action"], item["target_name"])
+                if chave not in vistas:
+                    vistas.add(chave)
+                    unicas.append(item)
+            logger.info(f"parse_multi_local detectou {len(unicas)} comandos compostos.")
+            return unicas
+
+    unico = parse_home_assistant_local(mensagem, last_target=last_target)
+    return [unico] if unico else None
 
 
 # ==========================================
@@ -364,20 +461,13 @@ def extrair_json(texto: str) -> Optional[str]:
     return None
 
 
-def validar_esquema_intencao(intencao_data: Any) -> Tuple[bool, Optional[str]]:
-    """
-    Valida rigorosamente o esquema retornado da LLM.
-    Garante que não aceitaremos tipos inesperados, listas ou campos malformados.
-    """
-    if not isinstance(intencao_data, dict):
+def _validar_item_intencao(item: Any) -> Tuple[bool, Optional[str]]:
+    if not isinstance(item, dict):
         return False, "invalid_type_not_dict"
 
-    if "error" in intencao_data:
-        return True, None  # Objeto de erro esperado (ex: unknown_device)
-
-    action = intencao_data.get("action")
-    target_name = intencao_data.get("target_name")
-    parameters = intencao_data.get("parameters", {})
+    action = item.get("action")
+    target_name = item.get("target_name")
+    parameters = item.get("parameters", {})
 
     if not isinstance(action, str) or not action.strip():
         return False, "missing_or_invalid_action"
@@ -389,6 +479,34 @@ def validar_esquema_intencao(intencao_data: Any) -> Tuple[bool, Optional[str]]:
         return False, "parameters_must_be_dict"
 
     return True, None
+
+
+def validar_esquema_intencao(intencao_data: Any) -> Tuple[bool, Optional[str]]:
+    """
+    Valida rigorosamente o esquema retornado da LLM.
+    Aceita objeto único {"action", "target_name", "parameters"} OU lote em passo único
+    {"actions": [{"action", "target_name", "parameters"}, ...]}, além de {"error": ...}.
+    Garante que não aceitaremos tipos inesperados, listas soltas na raiz ou campos malformados.
+    """
+    if not isinstance(intencao_data, dict):
+        return False, "invalid_type_not_dict"
+
+    if "error" in intencao_data:
+        return True, None  # Objeto de erro esperado (ex: unknown_device)
+
+    if "actions" in intencao_data:
+        actions_list = intencao_data.get("actions")
+        if not isinstance(actions_list, list) or not actions_list:
+            return False, "actions_must_be_non_empty_list"
+        if len(actions_list) > 8:
+            return False, "too_many_actions"
+        for item in actions_list:
+            ok, motivo = _validar_item_intencao(item)
+            if not ok:
+                return False, motivo
+        return True, None
+
+    return _validar_item_intencao(intencao_data)
 
 
 # ==========================================
@@ -528,3 +646,185 @@ def executar_comando_ha(comando: Dict[str, Any]) -> Tuple[bool, str]:
     except Exception as e:
         logger.error(f"Exceção ao comunicar com Home Assistant: {e}")
         return False, "Falha de conexão com o Home Assistant."
+
+
+def resolver_lista_comandos(intencao_ou_lote: Any) -> List[Dict[str, Any]]:
+    """
+    Converte uma intenção única, um dicionário {'actions': [...]} ou uma lista de intenções
+    em uma lista de comandos resolvidos e validados via DEVICE_REGISTRY.
+    """
+    if isinstance(intencao_ou_lote, list):
+        return [resolver_comando(item) for item in intencao_ou_lote]
+
+    if isinstance(intencao_ou_lote, dict):
+        if "actions" in intencao_ou_lote and isinstance(intencao_ou_lote["actions"], list):
+            return [resolver_comando(item) for item in intencao_ou_lote["actions"]]
+        return [resolver_comando(intencao_ou_lote)]
+
+    return [{"error": "invalid_format"}]
+
+
+def executar_lote_ha(
+    comandos: List[Dict[str, Any]],
+) -> Tuple[bool, str, Optional[str]]:
+    """
+    Executa 1 ou múltiplos comandos validados no Home Assistant em sequência.
+    Retorna (sucesso_geral, mensagem_resumo, ultimo_target_acionado).
+    """
+    if not comandos:
+        return False, "Nenhum comando válido para executar.", None
+
+    if len(comandos) == 1:
+        ok, msg = executar_comando_ha(comandos[0])
+        ultimo = comandos[0].get("target_name") if ok else None
+        return ok, msg, ultimo
+
+    sucessos = 0
+    erros: List[str] = []
+    ultimo_target: Optional[str] = None
+
+    for cmd in comandos:
+        ok, msg = executar_comando_ha(cmd)
+        if ok:
+            sucessos += 1
+            if cmd.get("target_name"):
+                ultimo_target = cmd["target_name"]
+        else:
+            erros.append(msg)
+
+    if sucessos == len(comandos):
+        return True, f"Todos os {sucessos} comandos foram executados com sucesso.", ultimo_target
+    if sucessos > 0:
+        return (
+            True,
+            f"Consegui executar {sucessos} de {len(comandos)} comandos, mas um deles falhou.",
+            ultimo_target,
+        )
+    return False, erros[0] if erros else "Não consegui executar os comandos.", None
+
+
+# ==========================================
+# CONSULTA DE ESTADO NO HOME ASSISTANT (GET /api/states)
+# ==========================================
+
+_RE_HA_STATE_QUERY_SINGLE = re.compile(
+    r"\b(?:est[áa]|t[áa]|ficou|continua)\s+(?:ligad[oa]|desligad[oa]|aces[oa]|apagad[oa])\b|"
+    r"\b(?:como\s+(?:est[áa]|t[áa])\s+(?:a|o)\s+(?:luz|tv|televis[ãa]o))\b",
+    re.IGNORECASE,
+)
+
+_RE_HA_STATE_QUERY_ALL = re.compile(
+    r"\b(?:quais\s+(?:s[ãa]o\s+as\s+)?(?:luzes|tvs|coisas)\s+(?:que\s+)?(?:est[ãa]o|t[ãa]o|ficaram)\s+(?:ligad[oa]s|acesas)|"
+    r"tem\s+alguma\s+(?:luz|tv|coisa)\s+(?:ligada|acesa)|"
+    r"ficou\s+alguma\s+(?:luz|tv|coisa)\s+(?:ligada|acesa)|"
+    r"o\s+que\s+(?:est[áa]|t[áa]|ficou)\s+(?:ligado|aceso)(?:\s+em\s+casa)?)\b",
+    re.IGNORECASE,
+)
+
+
+def consultar_estado_dispositivo_ha(nome_dispositivo: str) -> str:
+    """Consulta o estado atual ('on'/'off'/etc.) de um dispositivo registrado no HA."""
+    alvo_norm = normalize_text(nome_dispositivo or "")
+    canonico = (
+        alvo_norm
+        if alvo_norm in DEVICE_REGISTRY
+        else DEVICE_ALIASES.get(alvo_norm) or _match_target_device(alvo_norm)
+    )
+    if not canonico or canonico not in DEVICE_REGISTRY:
+        return "Olha, não encontrei esse dispositivo no meu cadastro da casa."
+
+    device = DEVICE_REGISTRY[canonico]
+    if device["domain"] == "automation":
+        return f"O item {canonico} é uma automação de disparo rápido, então não guarda estado ligado ou desligado."
+
+    if requests is None:
+        return "A biblioteca de conexão não está disponível para consultar o Home Assistant."
+
+    entity_id = device["entity_id"]
+    url = f"{HA_URL}/api/states/{entity_id}"
+
+    try:
+        resp = requests.get(url, headers=HEADERS_HA, timeout=HA_TIMEOUT)
+        if resp.status_code != 200:
+            logger.warning(f"Consulta de estado HA retornou HTTP {resp.status_code} para {entity_id}")
+            return f"Não consegui conferir o estado de {canonico} no Home Assistant agora."
+
+        dados = resp.json()
+        state = str(dados.get("state", "")).lower()
+        eh_luz = canonico.startswith("luz")
+
+        if state in ("on", "playing", "idle", "paused"):
+            estado_fala = "acesa" if eh_luz else "ligada"
+            return f"Dei uma olhada aqui e a {canonico} tá {estado_fala} nesse momento."
+        elif state in ("off", "standby"):
+            estado_fala = "apagada" if eh_luz else "desligada"
+            return f"Conferi aqui: a {canonico} tá {estado_fala}."
+        elif state in ("unavailable", "unknown"):
+            return f"Olha, a {canonico} aparece como indisponível ou sem sinal no Home Assistant agora."
+        return f"O estado atual de {canonico} no Home Assistant é {state}."
+    except Exception as e:
+        logger.error(f"Erro ao consultar estado de {entity_id}: {e}")
+        return "Tive um probleminha de conexão ao consultar o Home Assistant agora."
+
+
+def listar_dispositivos_ligados_ha() -> str:
+    """Lista quais interruptores/luzes/TVs registrados no DEVICE_REGISTRY estão ligados."""
+    if requests is None:
+        return "A biblioteca de conexão não está disponível no momento."
+
+    # Mapear entity_id -> nome amigável apenas para entidades com estado real (não automações)
+    mapa_entidades = {
+        info["entity_id"]: nome
+        for nome, info in DEVICE_REGISTRY.items()
+        if info.get("domain") != "automation"
+    }
+
+    url = f"{HA_URL}/api/states"
+    try:
+        resp = requests.get(url, headers=HEADERS_HA, timeout=HA_TIMEOUT)
+        if resp.status_code != 200:
+            return "Não consegui consultar a lista de estados do Home Assistant agora."
+
+        estados = resp.json()
+        if not isinstance(estados, list):
+            return "Recebi uma resposta inesperada do Home Assistant."
+
+        ligados: List[str] = []
+        for item in estados:
+            if not isinstance(item, dict):
+                continue
+            eid = item.get("entity_id")
+            if eid in mapa_entidades:
+                st = str(item.get("state", "")).lower()
+                if st in ("on", "playing", "idle", "paused"):
+                    ligados.append(mapa_entidades[eid])
+
+        if not ligados:
+            return "Dei uma geral aqui e tá tudo desligado em casa no momento."
+        if len(ligados) == 1:
+            return f"Olha, no momento só a {ligados[0]} tá ligada."
+        lista_txt = ", ".join(ligados[:-1]) + f" e {ligados[-1]}"
+        return f"Conferi aqui em casa e estão ligadas: {lista_txt}."
+    except Exception as e:
+        logger.error(f"Erro ao listar estados do Home Assistant: {e}")
+        return "Não consegui verificar os dispositivos do Home Assistant no momento."
+
+
+def parse_ha_state_query_local(mensagem: str) -> Optional[str]:
+    """
+    Identifica perguntas locais sobre estado da casa ('tem alguma luz acesa?',
+    'a luz da garagem tá ligada?') sem acionar dispositivos por engano.
+    """
+    if not mensagem:
+        return None
+
+    if _RE_HA_STATE_QUERY_ALL.search(mensagem):
+        return listar_dispositivos_ligados_ha()
+
+    if _RE_HA_STATE_QUERY_SINGLE.search(mensagem):
+        texto_norm = normalize_text(mensagem)
+        alvo = _match_target_device(texto_norm)
+        if alvo:
+            return consultar_estado_dispositivo_ha(alvo)
+
+    return None

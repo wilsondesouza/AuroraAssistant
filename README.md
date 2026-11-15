@@ -44,9 +44,12 @@ A Aurora combina **reconhecimento de voz** (Speech Recognition ), **automação 
 - **Cadeia de Fallback Automático**: Configure `TTS_FALLBACK_PROVIDERS=elevenlabs,openrouter` para contingência automática em caso de queda ou limite de cota; se todos falharem (ou sem internet), reproduz o áudio estático de contingência (`config/music/falha_tts.wav`).
 - **Prosódia Conversacional Carioca (pt-BR / RJ)**: System prompt e pipeline fonético otimizados para preservar pausas dramáticas (`—`), atuação vocal em citações (`'...'`), reticências (`...`), entonação de pergunta final (`?`) e leitura natural por extenso de horários e medidas.
 
-### ⏱️ Habilidades Rápidas (Hora e Clima)
-- **Hora Certa por Extenso**: Algoritmo local em português (*"Agora são duas e vinte da tarde"*).
-- **Previsão do Tempo (OpenWeather)**: Consulta em tempo real configurada via variáveis de ambiente, sem expor chaves no código-fonte.
+### ⏱️ Habilidades Rápidas, Timers, Memória da Casa & Conversa Contínua
+- **Hora Certa por Extenso e Clima (OpenWeather)**: Respostas imediatas em português natural.
+- **Janela de Contexto Deslizante + Conversa Contínua**: Mantém memória curta dos últimos turnos em RAM (com expiração automática de 3 min) e abre escuta automática com bip quando a Aurora encerra uma fala fazendo uma pergunta (`?`).
+- **Multi-Comando e Anáfora no Home Assistant**: Suporta comandos compostos (*"apaga a luz da sala e liga o ar condicionado"*) e referências ao último dispositivo (*"agora apaga ela"*), além de consultar estados (*"tem alguma luz ligada em casa?"*).
+- **Memória da Casa (Mini-RAG Ultra-Leve em SQLite)**: Guarda e recupera notas permanentes da família por voz (*"Aurora, lembra que o remédio da vó é às 8h na caixa azul"*) usando `sqlite3` FTS5 nativo + Embeddings semânticos gratuitos opcionais via Gemini API (0 MB de peso em IA local no Orange Pi).
+- **Timers Falados, Música Atual e Tool Calling Seletivo**: Cronômetros em thread (*"me avisa daqui a 10 minutos pra olhar o forno"*), consulta da faixa atual do Navidrome e *Sentence-Level Streaming* da LLM para o TTS.
 
 ---
 
@@ -65,9 +68,12 @@ AuroraAssistant/
 ├── refatored/                        ← Nova arquitetura modular e segura v2.0
 │   ├── app.py                        ← Ponto de entrada (Modo Voz e Modo CLI de teste)
 │   ├── config.py                     ← Carregamento de ambiente, caminhos e sanitização de logs
-│   ├── llm_client.py                 ← Cliente LLM universal pluggável com fallback
-│   ├── intent_router.py              ← Roteador central (Fast-path local + LLM sob demanda)
-│   ├── home_assistant.py             ← Registry de entidades, parser determinístico e cliente HA
+│   ├── llm_client.py                 ← Cliente LLM universal (Structured JSON, Tool Calling <=2 passos e Streaming SSE)
+│   ├── intent_router.py              ← Roteador central (Fast-path local + Contexto + Mini-RAG + LLM sob demanda)
+│   ├── conversation_memory.py        ← Janela deslizante curta em RAM com TTL, anáfora HA e suporte a Prompt Caching
+│   ├── memory_store.py               ← Memória da Casa (Mini-RAG em SQLite FTS5 + Embeddings Gemini em Python puro)
+│   ├── skills.py                     ← Timers falados em thread, consulta de música atual e registro de Tools
+│   ├── home_assistant.py             ← Registry seguro, parser simples/multi/anafórico, lote JSON e consulta de estado HA
 │   ├── music.py                      ← Controlador thread-safe do player e Navidrome
 │   ├── speech_input.py               ← Microfone, ruído ambiente, wake word e Whisper local
 │   ├── tts_client.py                 ← Cliente TTS universal pluggável (Google, ElevenLabs, OpenRouter) + normalização prosódica

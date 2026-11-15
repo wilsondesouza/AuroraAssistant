@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 
@@ -10,11 +11,18 @@ import time
 import logging
 import argparse
 
-from refatored.config import setup_logging, validate_config
+from refatored.config import (
+    setup_logging,
+    validate_config,
+    CONTINUOUS_CONVERSATION,
+    CONTINUOUS_MAX_TURNS,
+    CONTINUOUS_LISTEN_TIMEOUT,
+)
 from refatored.speech_input import speech_input
 from refatored.speech_output import play_confirmation, play_error, falar
 from refatored.intent_router import intent_router
 from refatored.music import music_player
+from refatored.skills import timer_manager
 
 logger = logging.getLogger("aurora.app")
 
@@ -22,8 +30,8 @@ logger = logging.getLogger("aurora.app")
 def print_banner():
     banner = """
     ╔═════════════════════════════════════════════════╗
-    ║             AURORA ASSISTANT 2.0                ║
-    ║   Automação Residencial | Música | Conversa     ║
+    ║             AURORA ASSISTANT 2.5                ║
+    ║   Automação | Música | Memória | Conversa Viva  ║
     ╚═════════════════════════════════════════════════╝
     """
     print(banner)
@@ -35,34 +43,91 @@ def configure_output_encoding():
             stream.reconfigure(encoding="utf-8", errors="backslashreplace")
 
 
+def _shutdown_services():
+    """Encerra reprodução de música e timers pendentes com segurança."""
+    music_player.stop()
+    timer_manager.cancel_all()
+
+
+def _is_continuous_conversation_enabled() -> bool:
+    env_val = os.getenv("CONTINUOUS_CONVERSATION")
+    if env_val is not None:
+        return env_val.lower().strip() in ("1", "true", "yes", "on")
+    return CONTINUOUS_CONVERSATION
+
+
+def _executar_loop_followup_voz(resultado_inicial: dict) -> None:
+    """
+    Quando a resposta da Aurora termina em pergunta ('?'), toca o bip de confirmação
+    e escuta a resposta do usuário por alguns segundos sem exigir repetir 'Aurora'.
+    """
+    if not _is_continuous_conversation_enabled():
+        return
+
+    max_turns = max(
+        1, int(os.getenv("CONTINUOUS_MAX_TURNS", str(CONTINUOUS_MAX_TURNS)))
+    )
+    listen_timeout = float(
+        os.getenv("CONTINUOUS_LISTEN_TIMEOUT", str(CONTINUOUS_LISTEN_TIMEOUT))
+    )
+
+    resultado = resultado_inicial or {}
+    turno = 0
+
+    while resultado.get("expect_followup") and turno < max_turns:
+        turno += 1
+        logger.info(
+            f"Conversa contínua ({turno}/{max_turns}): Aurora fez uma pergunta; "
+            f"emitindo bip e aguardando resposta por {listen_timeout:.1f}s..."
+        )
+        play_confirmation(blocking=True)
+        resposta_usuario = speech_input.escutar_comando(timeout=listen_timeout)
+
+        if not resposta_usuario:
+            logger.info("Silêncio na janela de continuação; retornando à escuta da wake word.")
+            break
+
+        resultado = intent_router.processar_mensagem(
+            resposta_usuario,
+            is_followup=True,
+        )
+
+
 def run_cli_mode():
     """Modo interativo por terminal para testes rápidos sem depender de microfone."""
     logger.info("Iniciando Aurora Assistant em modo texto (CLI)...")
     print("\nModo texto ativado. Digite seus comandos ou 'sair' para encerrar.\n")
 
+    em_followup = False
     while True:
         try:
-            comando = input("\n[Você]: ").strip()
+            prompt_label = "\n[Você (continuação)]: " if em_followup else "\n[Você]: "
+            comando = input(prompt_label).strip()
             if not comando:
+                em_followup = False
                 continue
             if comando.lower() in ("sair", "exit", "quit"):
                 print("Encerrando Aurora Assistant.")
-                music_player.stop()
+                _shutdown_services()
                 break
 
-            resultado = intent_router.processar_mensagem(comando)
+            resultado = intent_router.processar_mensagem(comando, is_followup=em_followup)
             print(f"[Aurora]: {resultado.get('message')}")
+            em_followup = bool(
+                _is_continuous_conversation_enabled() and resultado.get("expect_followup")
+            )
 
         except KeyboardInterrupt:
             print("\nEncerrando.")
-            music_player.stop()
+            _shutdown_services()
             break
         except Exception as e:
             logger.error(f"Erro no processamento: {e}")
+            em_followup = False
 
 
 def run_voice_mode():
-    """Modo principal contínuo acionado por voz (wake word 'aurora')."""
+    """Modo principal contínuo acionado por voz (wake word 'aurora' + follow-up inteligente)."""
     logger.info("Iniciando Aurora Assistant em modo de voz...")
 
     # 1. Inicializar entrada de voz e calibrar microfone
@@ -82,7 +147,8 @@ def run_voice_mode():
                 comando = speech_input.escutar_comando()
 
                 if comando:
-                    intent_router.processar_mensagem(comando)
+                    resultado = intent_router.processar_mensagem(comando, is_followup=False)
+                    _executar_loop_followup_voz(resultado)
                 else:
                     logger.debug("Nenhum comando detectado após ativação.")
             else:
@@ -90,7 +156,7 @@ def run_voice_mode():
 
         except KeyboardInterrupt:
             logger.info("Interrupção pelo usuário (Ctrl+C). Encerrando...")
-            music_player.stop()
+            _shutdown_services()
             break
         except Exception as e:
             logger.error(f"Erro inesperado no loop principal: {e}")

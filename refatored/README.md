@@ -46,12 +46,15 @@ refatored/
 ├── __init__.py
 ├── config.py             # Configurações de ambiente, caminhos, logs e validação
 ├── app.py                # Ponto de entrada, orquestrador do loop de eventos e modo CLI
-├── llm_client.py         # Cliente LLM universal pluggável (OpenRouter, Groq, Gemini, Ollama, etc.)
+├── llm_client.py         # Cliente LLM universal (Structured JSON, Tool Calling <=2 passos e Streaming SSE)
+├── conversation_memory.py# Janela deslizante curta em RAM com TTL, anáfora HA e prefixo fixo p/ KV-Cache
+├── memory_store.py       # Mini-RAG doméstico em SQLite FTS5 + Embeddings gratuitos Gemini em Python puro
+├── skills.py             # Timers/lembretes em thread, música atual do Navidrome e registro de Tools
 ├── speech_input.py       # Microfone, calibração, wake word ('aurora') e Whisper local
 ├── tts_client.py         # Cliente TTS universal pluggável (Google, ElevenLabs, OpenRouter) e normalização prosódica
-├── speech_output.py      # Orquestrador de fala, boost de volume ALSA, fallback estático e player de som
-├── intent_router.py      # Orquestrador do fluxo: fast-path local + roteamento LLM
-├── home_assistant.py     # Registro de dispositivos, parser determinístico e cliente HA seguro
+├── speech_output.py      # Orquestrador de fala, streaming por frase em fila, boost ALSA e fallback estático
+├── intent_router.py      # Orquestrador do fluxo: fast-path local + contexto + RAG + roteamento LLM
+├── home_assistant.py     # Registro de dispositivos, parser simples/multi/anafórico e consulta de estado HA
 ├── music.py              # Controlador thread-safe do player de música e Navidrome
 ├── local_intents.py      # Hora por extenso e clima (OpenWeather)
 ├── prompts.py            # Prompts estruturados e versionados

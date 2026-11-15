@@ -1,7 +1,8 @@
 import json
+import os
+import re
 import logging
-import time
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, List, Tuple
 
 try:
     import requests
@@ -12,23 +13,58 @@ from refatored.config import (
     MODEL_CONVERSA,
     MODEL_CLASSIFICADOR,
     MODEL_HA,
+    LLM_ENABLE_TOOLS,
+    LLM_STREAM_TTS,
     sanitize_for_log,
 )
 from refatored.prompts import PROMPT_CONVERSA, PROMPT_HA, PROMPT_CLASSIFICADOR
 from refatored.home_assistant import (
     DEVICE_REGISTRY,
     parse_home_assistant_local,
+    parse_home_assistant_multi_local,
+    parse_ha_state_query_local,
     extrair_json,
     validar_esquema_intencao,
     resolver_comando,
+    resolver_lista_comandos,
     executar_comando_ha,
 )
 from refatored.music import music_player, parse_music_local
 from refatored.local_intents import get_time_response, get_weather_response
-from refatored.speech_output import falar, play_confirmation, play_error
+from refatored.speech_output import falar, falar_em_stream, play_confirmation, play_error
 from refatored.llm_client import llm_client
+from refatored.conversation_memory import (
+    conversation_memory,
+    is_dismissal_phrase,
+    should_expect_followup,
+)
+from refatored.memory_store import memory_store, handle_memory_command_local
+from refatored.skills import (
+    parse_timer_local,
+    parse_music_query_local,
+    TOOLS_SPEC,
+    execute_tool_call,
+)
 
 logger = logging.getLogger(__name__)
+
+# Gatilho leve para ativar Tool Calling apenas quando a frase sugerir ação/consulta híbrida,
+# economizando ~650 tokens de schema em conversas casuais e preservando o streaming de voz!
+_RE_HYBRID_TOOL_HINT = re.compile(
+    r"\b(?:clima|tempo|temperatura|chover|calor|frio|graus|horas?|hor[áa]rio|"
+    r"luz(?:es)?|tv|televis[ãa]o|ar[\s-]?condicionado|sala|quarto|varanda|garagem|banheiro|"
+    r"ligad[oa]s?|aces[oa]s?|desligad[oa]s?|apagad[oa]s?|liga(?:r)?|desliga(?:r)?|acende(?:r)?|apaga(?:r)?|"
+    r"m[úu]sica|tocando|faixa|som|timer|cron[ôo]metro|alarme|avisa(?:r)?|daqui\s+a|"
+    r"lembra(?:r)?|mem[óo]ria|guarda(?:r)?|anota(?:r)?|salva(?:r)?|senha|rem[ée]dio)\b",
+    re.IGNORECASE,
+)
+
+
+def _may_require_tools(mensagem: str) -> bool:
+    if not mensagem:
+        return False
+    return bool(_RE_HYBRID_TOOL_HINT.search(mensagem))
+
 
 # ==========================================
 # CLIENTE LLM (PLUGGÁVEL VIA LLM_CLIENT)
@@ -39,7 +75,9 @@ def chamar_modelo(
     system_prompt: str,
     mensagem_usuario: str,
     retries: int = 2,
-    timeout: int = 15
+    timeout: int = 15,
+    messages_override: Optional[List[Dict[str, Any]]] = None,
+    json_mode: bool = False,
 ) -> Optional[str]:
     """
     Chama modelo LLM através do cliente universal pluggável.
@@ -50,14 +88,19 @@ def chamar_modelo(
         system_prompt=system_prompt,
         mensagem_usuario=mensagem_usuario,
         retries=retries,
-        timeout=timeout
+        timeout=timeout,
+        messages_override=messages_override,
+        json_mode=json_mode,
     )
+
+
+_DEFAULT_CHAMAR_MODELO = chamar_modelo
+_DEFAULT_PARSE_HA_LOCAL = parse_home_assistant_local
 
 
 def classificar_mensagem_llm(mensagem: str) -> Optional[str]:
     """
     Classifica a intenção via LLM.
-    CORREÇÃO CRÍTICA: Não usa apenas substring flexível que aceitava texto espúrio.
     Retorna estritamente 'home_assistant', 'music', 'conversation' ou None.
     """
     prompt = PROMPT_CLASSIFICADOR
@@ -67,7 +110,6 @@ def classificar_mensagem_llm(mensagem: str) -> Optional[str]:
 
     limpo = resposta.strip().lower()
 
-    # Validação exata ou normalizada
     if "home_assistant" in limpo or "homeassistant" in limpo:
         return "home_assistant"
     elif "music" in limpo or "musica" in limpo:
@@ -79,12 +121,31 @@ def classificar_mensagem_llm(mensagem: str) -> Optional[str]:
 
 
 def extrair_intencao_ha_llm(mensagem: str) -> Dict[str, Any]:
-    """Usa LLM para extrair intenção estruturada de Home Assistant com validação."""
+    """Usa LLM (com Structured Output json_object) para extrair 1 ou N intenções HA validadas."""
     lista_nomes = ", ".join(DEVICE_REGISTRY.keys())
-    prompt_completo = f"{PROMPT_HA}\n\nDispositivos e automações disponíveis:\n{lista_nomes}"
+    ultimo_alvo = conversation_memory.get_last_ha_target()
+    contexto_extra = (
+        f"\nÚltimo dispositivo acionado recentemente (use se o usuário disser 'ela'/'isso'): {ultimo_alvo}"
+        if ultimo_alvo
+        else ""
+    )
+    prompt_completo = (
+        f"{PROMPT_HA}\n\nDispositivos e automações disponíveis:\n{lista_nomes}{contexto_extra}"
+    )
 
-    logger.info("Extraindo intenção Home Assistant via LLM...")
-    resposta = chamar_modelo(MODEL_HA, prompt_completo, mensagem, retries=1, timeout=12)
+    logger.info("Extraindo intenção Home Assistant via LLM (Structured Output)...")
+    if chamar_modelo is _DEFAULT_CHAMAR_MODELO:
+        resposta = chamar_modelo(
+            MODEL_HA,
+            prompt_completo,
+            mensagem,
+            retries=1,
+            timeout=12,
+            json_mode=True,
+        )
+    else:
+        resposta = chamar_modelo(MODEL_HA, prompt_completo, mensagem, retries=1, timeout=12)
+
     if not resposta:
         logger.error("Sem resposta do modelo de Home Assistant.")
         return {"error": "no_response"}
@@ -111,18 +172,69 @@ def extrair_intencao_ha_llm(mensagem: str) -> Dict[str, Any]:
 # ==========================================
 
 class IntentRouter:
-    """Roteador principal de mensagens, priorizando parsers locais e chamando IA sob demanda."""
+    """
+    Roteador central da Aurora Assistant:
+      1. Fast-Path determinístico local (Hora, Clima, Timers, Memória, Status HA/Música, HA Simples/Multi/Anafórico, Música)
+      2. Roteamento inteligente com LLM + Janela Deslizante + Mini-RAG SQLite + Tool Calling + Streaming TTS
+    """
 
-    def processar_mensagem(self, mensagem: str) -> Dict[str, Any]:
+    def _executar_comandos_ha_validados(
+        self, comandos: List[Dict[str, Any]]
+    ) -> Tuple[bool, str]:
+        """Executa 1 ou múltiplos comandos HA registrando o último alvo na memória curta."""
+        if len(comandos) == 1:
+            sucesso, msg_ha = executar_comando_ha(comandos[0])
+            if sucesso and comandos[0].get("target_name"):
+                conversation_memory.record_ha_target(comandos[0]["target_name"])
+            return sucesso, msg_ha
+
+        sucessos = 0
+        ultimo_erro = "Não foi possível executar os comandos."
+        for cmd in comandos:
+            ok, msg = executar_comando_ha(cmd)
+            if ok:
+                sucessos += 1
+                if cmd.get("target_name"):
+                    conversation_memory.record_ha_target(cmd["target_name"])
+            else:
+                ultimo_erro = msg
+
+        if sucessos == len(comandos):
+            return True, f"Todos os {sucessos} comandos foram executados com sucesso."
+        if sucessos > 0:
+            return True, f"Executei {sucessos} de {len(comandos)} comandos."
+        return False, ultimo_erro
+
+    def processar_mensagem(
+        self,
+        mensagem: str,
+        is_followup: bool = False,
+    ) -> Dict[str, Any]:
         """
-        Processa a mensagem do usuário em etapas otimizadas:
-        1. Regras locais determinísticas (Hora, Clima, HA local, Música local)
-        2. Se não resolvido localmente, consulta classificador e modelos remotos
+        Processa a mensagem do usuário em etapas otimizadas.
+        Inclui sinalizador 'expect_followup' quando a Aurora encerra com pergunta ('?').
         """
         if not mensagem or not mensagem.strip():
-            return {"intent": "empty", "success": False, "message": "Mensagem vazia."}
+            return {
+                "intent": "empty",
+                "success": False,
+                "message": "Mensagem vazia.",
+                "expect_followup": False,
+            }
 
-        logger.info(f"=== Processando mensagem: '{mensagem}' ===")
+        logger.info(f"=== Processando mensagem: '{mensagem}' (followup={is_followup}) ===")
+
+        # 0. Encerramento natural no modo de conversa contínua ("Não, obrigado!", "Só isso")
+        if is_followup and is_dismissal_phrase(mensagem):
+            despedida = "Beleza! Qualquer coisa é só me chamar."
+            falar(despedida)
+            conversation_memory.add_turn(mensagem, despedida)
+            return {
+                "intent": "followup_end",
+                "success": True,
+                "message": despedida,
+                "expect_followup": False,
+            }
 
         # ----------------------------------------------------
         # ETAPA 1: VERIFICAÇÃO LOCAL DETERMINÍSTICA (FAST PATH)
@@ -134,7 +246,13 @@ class IntentRouter:
             logger.info("Intenção local detectada: HORA")
             play_confirmation()
             falar(resp_hora)
-            return {"intent": "time", "success": True, "message": resp_hora}
+            conversation_memory.add_turn(mensagem, resp_hora)
+            return {
+                "intent": "time",
+                "success": True,
+                "message": resp_hora,
+                "expect_followup": False,
+            }
 
         # 1.2. Clima / Previsão do tempo
         resp_clima = get_weather_response(mensagem)
@@ -142,34 +260,119 @@ class IntentRouter:
             logger.info("Intenção local detectada: CLIMA")
             play_confirmation()
             falar(resp_clima)
-            return {"intent": "weather", "success": True, "message": resp_clima}
+            conversation_memory.add_turn(mensagem, resp_clima)
+            return {
+                "intent": "weather",
+                "success": True,
+                "message": resp_clima,
+                "expect_followup": False,
+            }
 
-        # 1.3. Parser local de Home Assistant
-        # CORREÇÃO CRÍTICA: Não espera o classificador remoto para comandos HA claros!
-        intencao_ha_local = parse_home_assistant_local(mensagem)
-        if intencao_ha_local:
-            if "error" in intencao_ha_local:
+        # 1.3. Timers e Lembretes Rápidos por Voz
+        resp_timer = parse_timer_local(mensagem)
+        if resp_timer:
+            logger.info("Intenção local detectada: TIMER")
+            play_confirmation()
+            falar(resp_timer)
+            conversation_memory.add_turn(mensagem, resp_timer)
+            return {
+                "intent": "timer",
+                "success": True,
+                "message": resp_timer,
+                "expect_followup": False,
+            }
+
+        # 1.4. Memória da Casa / Família (Salvar, Listar ou Esquecer fatos no SQLite)
+        resp_memoria = handle_memory_command_local(mensagem)
+        if resp_memoria:
+            logger.info("Intenção local detectada: MEMÓRIA DA CASA")
+            play_confirmation()
+            falar(resp_memoria)
+            conversation_memory.add_turn(mensagem, resp_memoria)
+            return {
+                "intent": "memory",
+                "success": True,
+                "message": resp_memoria,
+                "expect_followup": False,
+            }
+
+        # 1.5. Consulta de Música Atual ("que música tá tocando?")
+        resp_musica_info = parse_music_query_local(mensagem)
+        if resp_musica_info:
+            logger.info("Intenção local detectada: CONSULTA MÚSICA ATUAL")
+            play_confirmation()
+            falar(resp_musica_info)
+            conversation_memory.add_turn(mensagem, resp_musica_info)
+            return {
+                "intent": "music_info",
+                "success": True,
+                "message": resp_musica_info,
+                "expect_followup": False,
+            }
+
+        # 1.6. Consulta de Estado no Home Assistant ("a luz da sala tá acesa?", "tem luz ligada?")
+        resp_estado_ha = parse_ha_state_query_local(mensagem)
+        if resp_estado_ha:
+            logger.info("Intenção local detectada: CONSULTA ESTADO HA")
+            play_confirmation()
+            falar(resp_estado_ha)
+            conversation_memory.add_turn(mensagem, resp_estado_ha)
+            return {
+                "intent": "home_assistant_state",
+                "success": True,
+                "message": resp_estado_ha,
+                "expect_followup": False,
+            }
+
+        # 1.7. Parser local de Home Assistant (Simples, Multi-comando e Anafórico)
+        ultimo_alvo_ha = conversation_memory.get_last_ha_target()
+        if parse_home_assistant_local is not _DEFAULT_PARSE_HA_LOCAL:
+            unico_mock = parse_home_assistant_local(mensagem)
+            intencoes_ha_locais = [unico_mock] if unico_mock else None
+        else:
+            intencoes_ha_locais = parse_home_assistant_multi_local(
+                mensagem, last_target=ultimo_alvo_ha
+            )
+
+        if intencoes_ha_locais:
+            primeira = intencoes_ha_locais[0]
+            if "error" in primeira:
                 play_error()
-                return {"intent": "home_assistant_local", "success": False, "message": intencao_ha_local["error"]}
+                return {
+                    "intent": "home_assistant_local",
+                    "success": False,
+                    "message": primeira["error"],
+                    "expect_followup": False,
+                }
 
-            logger.info("Intenção local detectada: HOME ASSISTANT DETERMINÍSTICO")
-            comando = resolver_comando(intencao_ha_local)
-            sucesso, msg_ha = executar_comando_ha(comando)
+            logger.info(
+                f"Intenção local detectada: HOME ASSISTANT DETERMINÍSTICO "
+                f"({len(intencoes_ha_locais)} ação/ações)"
+            )
+            comandos = [resolver_comando(item) for item in intencoes_ha_locais]
+            sucesso, msg_ha = self._executar_comandos_ha_validados(comandos)
             if sucesso:
                 play_confirmation()
             else:
                 play_error()
                 falar(msg_ha)
-            return {"intent": "home_assistant_local", "success": sucesso, "message": msg_ha}
+            return {
+                "intent": "home_assistant_local",
+                "success": sucesso,
+                "message": msg_ha,
+                "expect_followup": False,
+            }
 
-        # 1.4. Parser local de Música
+        # 1.8. Parser local de Música
         acao_musica = parse_music_local(mensagem)
         if acao_musica:
             logger.info(f"Intenção local detectada: MÚSICA ({acao_musica})")
-            return self._executar_acao_musica(acao_musica)
+            res_musica = self._executar_acao_musica(acao_musica)
+            res_musica["expect_followup"] = False
+            return res_musica
 
         # ----------------------------------------------------
-        # ETAPA 2: FALLBACK PARA CLASSIFICAÇÃO VIA LLM
+        # ETAPA 2: FALLBACK PARA CLASSIFICAÇÃO E CONVERSA VIA LLM
         # ----------------------------------------------------
         logger.info("Comando não identificado localmente. Consultando classificador LLM...")
         modo = classificar_mensagem_llm(mensagem)
@@ -179,39 +382,153 @@ class IntentRouter:
             play_error()
             msg_erro = "Desculpe, estou com dificuldades de conexão aos servidores no momento."
             falar(msg_erro)
-            return {"intent": "classifier_unavailable", "success": False, "message": msg_erro}
+            return {
+                "intent": "classifier_unavailable",
+                "success": False,
+                "message": msg_erro,
+                "expect_followup": False,
+            }
 
         logger.info(f"Classificador remoto definiu modo: '{modo}'")
 
         if modo == "home_assistant":
             intencao_llm = extrair_intencao_ha_llm(mensagem)
-            comando = resolver_comando(intencao_llm)
-            sucesso, msg_ha = executar_comando_ha(comando)
+            comandos = resolver_lista_comandos(intencao_llm)
+            sucesso, msg_ha = self._executar_comandos_ha_validados(comandos)
             if sucesso:
                 play_confirmation()
             else:
                 play_error()
                 falar(msg_ha)
-            return {"intent": "home_assistant_llm", "success": sucesso, "message": msg_ha}
+            return {
+                "intent": "home_assistant_llm",
+                "success": sucesso,
+                "message": msg_ha,
+                "expect_followup": False,
+            }
 
         elif modo == "music":
-            # Tentar novamente identificar ação ou tocar por padrão
             acao_secundaria = parse_music_local(mensagem) or "play"
-            return self._executar_acao_musica(acao_secundaria)
+            res_musica = self._executar_acao_musica(acao_secundaria)
+            res_musica["expect_followup"] = False
+            return res_musica
 
         else:
-            # Modo conversa geral
-            logger.info("Executando fluxo de conversa com LLM...")
+            # Modo conversa inteligente (com Memória Curta + Mini-RAG SQLite + Tools + Streaming TTS)
+            return self._processar_conversa_llm(mensagem)
+
+    def _processar_conversa_llm(self, mensagem: str) -> Dict[str, Any]:
+        """Executa o fluxo de conversa enriquecido com contexto, RAG doméstico, Tools e Streaming."""
+        logger.info("Executando fluxo de conversa com LLM...")
+
+        # 1. Buscar fatos relevantes na Memória da Casa (SQLite FTS5 + Embeddings opcionais)
+        fatos_relevantes = memory_store.search(mensagem)
+        if fatos_relevantes:
+            logger.info(f"Mini-RAG injetou {len(fatos_relevantes)} memória(s) da casa no contexto.")
+
+        # 2. Montar mensagens mantendo PROMPT_CONVERSA fixo na posição 0 (Prompt Caching friendly)
+        messages = conversation_memory.build_messages(
+            static_system_prompt=PROMPT_CONVERSA,
+            user_message=mensagem,
+            rag_facts=fatos_relevantes,
+        )
+
+        # Compatibilidade total caso chamar_modelo tenha sido substituído por mock em testes:
+        if chamar_modelo is not _DEFAULT_CHAMAR_MODELO:
             resposta = chamar_modelo(MODEL_CONVERSA, PROMPT_CONVERSA, mensagem)
             if resposta:
-                logger.info(f"Resposta IA gerada: '{resposta[:80]}...'")
                 falar(resposta)
-                return {"intent": "conversation", "success": True, "message": resposta}
-            else:
-                play_error()
-                msg_erro = "Não consegui responder agora."
-                falar(msg_erro)
-                return {"intent": "conversation", "success": False, "message": msg_erro}
+                conversation_memory.add_turn(mensagem, resposta)
+                return {
+                    "intent": "conversation",
+                    "success": True,
+                    "message": resposta,
+                    "expect_followup": should_expect_followup(resposta),
+                }
+            return self._falha_conversa()
+
+        tools_enabled_env = os.getenv("LLM_ENABLE_TOOLS")
+        use_tools = (
+            tools_enabled_env.lower().strip() in ("1", "true", "yes", "on")
+            if tools_enabled_env is not None
+            else LLM_ENABLE_TOOLS
+        )
+
+        stream_enabled_env = os.getenv("LLM_STREAM_TTS")
+        use_stream = (
+            stream_enabled_env.lower().strip() in ("1", "true", "yes", "on")
+            if stream_enabled_env is not None
+            else LLM_STREAM_TTS
+        )
+
+        # 3a. Se a mensagem sugerir ação híbrida (clima + casa, timer, memória, status), usa Tool Calling (max_steps<=2)
+        if use_tools and _may_require_tools(mensagem):
+            resposta, _ = llm_client.chamar_com_tools(
+                modelo=MODEL_CONVERSA,
+                messages=messages,
+                tools=TOOLS_SPEC,
+                tool_executor=execute_tool_call,
+            )
+            if resposta:
+                logger.info(f"Resposta IA (com suporte a tools): '{resposta[:80]}...'")
+                falar(resposta)
+                conversation_memory.add_turn(mensagem, resposta)
+                return {
+                    "intent": "conversation",
+                    "success": True,
+                    "message": resposta,
+                    "expect_followup": should_expect_followup(resposta),
+                }
+            return self._falha_conversa()
+
+        # 3b. Conversa direta com Streaming por Frase Completa (menor latência até a voz sair)
+        if use_stream:
+            frases_iter = llm_client.chamar_stream_frases(
+                modelo=MODEL_CONVERSA,
+                messages=messages,
+            )
+            resposta_stream = falar_em_stream(frases_iter)
+            if resposta_stream:
+                logger.info(f"Resposta IA transmitida em stream: '{resposta_stream[:80]}...'")
+                conversation_memory.add_turn(mensagem, resposta_stream)
+                return {
+                    "intent": "conversation",
+                    "success": True,
+                    "message": resposta_stream,
+                    "expect_followup": should_expect_followup(resposta_stream),
+                }
+            return self._falha_conversa()
+
+        # 3c. Conversa síncrona tradicional (quando LLM_STREAM_TTS=false)
+        resposta = chamar_modelo(
+            MODEL_CONVERSA,
+            PROMPT_CONVERSA,
+            mensagem,
+            messages_override=messages,
+        )
+        if resposta:
+            logger.info(f"Resposta IA gerada: '{resposta[:80]}...'")
+            falar(resposta)
+            conversation_memory.add_turn(mensagem, resposta)
+            return {
+                "intent": "conversation",
+                "success": True,
+                "message": resposta,
+                "expect_followup": should_expect_followup(resposta),
+            }
+        return self._falha_conversa()
+
+    @staticmethod
+    def _falha_conversa() -> Dict[str, Any]:
+        play_error()
+        msg_erro = "Não consegui responder agora."
+        falar(msg_erro)
+        return {
+            "intent": "conversation",
+            "success": False,
+            "message": msg_erro,
+            "expect_followup": False,
+        }
 
     def _executar_acao_musica(self, acao: str) -> Dict[str, Any]:
         """Executa ações de música e gerencia feedback auditivo."""

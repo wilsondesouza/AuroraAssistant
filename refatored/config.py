@@ -152,8 +152,41 @@ SMARTLUME_STATUS_FILE = os.getenv(
 )
 
 
-# Reconhecimento de Voz
+# Reconhecimento de Voz & Conversa Contínua (Follow-up sem Wake Word)
 WAKE_WORD = os.getenv("WAKE_WORD", "aurora").lower()
+CONTINUOUS_CONVERSATION = os.getenv("CONTINUOUS_CONVERSATION", "true").lower().strip() in (
+    "1", "true", "yes", "on"
+)
+CONTINUOUS_MAX_TURNS = max(1, int(os.getenv("CONTINUOUS_MAX_TURNS", "3")))
+CONTINUOUS_LISTEN_TIMEOUT = float(os.getenv("CONTINUOUS_LISTEN_TIMEOUT", "5.0"))
+
+# Memória de Curto Prazo (Janela de Contexto Deslizante com Expiração)
+CONVERSATION_HISTORY_TURNS = max(1, int(os.getenv("CONVERSATION_HISTORY_TURNS", "3")))
+CONVERSATION_TTL_SECONDS = max(15, int(os.getenv("CONVERSATION_TTL_SECONDS", "180")))
+
+# Memória de Longo Prazo da Casa / Mini-RAG em SQLite + Embeddings Gemini Opcionais
+MEMORY_DB_PATH = os.getenv(
+    "MEMORY_DB_PATH",
+    str(PROJECT_ROOT / "config" / "memory" / "aurora_memory.db"),
+).strip()
+MEMORY_TOP_K = max(1, int(os.getenv("MEMORY_TOP_K", "3")))
+MEMORY_USE_EMBEDDINGS = os.getenv("MEMORY_USE_EMBEDDINGS", "true").lower().strip() in (
+    "1", "true", "yes", "on"
+)
+GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-001").strip()
+
+# Capacidades Avançadas de LLM (Structured Output, Tool Calling & Streaming TTS)
+LLM_USE_JSON_MODE = os.getenv("LLM_USE_JSON_MODE", "true").lower().strip() in (
+    "1", "true", "yes", "on"
+)
+LLM_ENABLE_TOOLS = os.getenv("LLM_ENABLE_TOOLS", "true").lower().strip() in (
+    "1", "true", "yes", "on"
+)
+LLM_TOOL_MAX_STEPS = min(3, max(1, int(os.getenv("LLM_TOOL_MAX_STEPS", "2"))))
+LLM_STREAM_TTS = os.getenv("LLM_STREAM_TTS", "true").lower().strip() in (
+    "1", "true", "yes", "on"
+)
+LLM_STREAM_MIN_CHARS = max(20, int(os.getenv("LLM_STREAM_MIN_CHARS", "55")))
 
 
 # ==========================================
@@ -168,8 +201,13 @@ def sanitize_for_log(text: str) -> str:
     cleaned = re.sub(r'([?&](?:p|password|t|token|key|appid)=)[^&]+', r'\1***', text, flags=re.IGNORECASE)
     # Ocultar Authorization Bearer
     cleaned = re.sub(r'(Bearer\s+)[A-Za-z0-9\-_.]+', r'\1***', cleaned, flags=re.IGNORECASE)
-    # Ocultar xi-api-key (ElevenLabs) caso apareça em headers serializados
-    cleaned = re.sub(r'(xi-api-key["\']?\s*[:=]\s*["\']?)[A-Za-z0-9\-_.]+', r'\1***', cleaned, flags=re.IGNORECASE)
+    # Ocultar xi-api-key (ElevenLabs) e x-goog-api-key (Gemini) caso apareçam em logs
+    cleaned = re.sub(
+        r'((?:xi-api-key|x-goog-api-key)["\']?\s*[:=]\s*["\']?)[A-Za-z0-9\-_.]+',
+        r'\1***',
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     return cleaned
 
 def setup_logging(level=logging.INFO):

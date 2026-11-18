@@ -208,7 +208,18 @@ DEVICE_ALIASES: Dict[str, str] = {
 # ==========================================
 
 # Regex para comandos de negação (devem ser rejeitados para evitar acionamentos acidentais)
-RE_NEGACAO = re.compile(r'\bn(?:ã|a)o\s+(?:(?:vai\s+)?(?:ligar|desligar|acender|apagar|ativar|desativar|tocar|abrir|fechar)|liga|desliga|acende|apaga)\b', re.IGNORECASE)
+# Cobre os auxiliares mais comuns do português falado: "não PRECISA ligar",
+# "não QUERO acender", "não VOU desligar", "não É PRA apagar", "sem ligar", "nunca abrir".
+RE_NEGACAO = re.compile(
+    r"\bn(?:ã|a)o\s+"
+    r"(?:(?:precis\w*|quer\w*|vou|vai|vamos|va|deve\w*|pode\w*|podia|tem|tenho|"
+    r"é|e|era|estou|est\w*|consegue|conseguiu|adianta|dá|da|pra|para|mesmo|nem)\s+)*"
+    r"(?:ligar|desligar|acender|apagar|ativar|desativar|tocar|abrir|fechar|"
+    r"liga|desliga|acende|apaga|ativa|desativa|toca|abre|fecha)\b"
+    r"|\b(?:sem|evita|evite|jamais|nunca)\s+"
+    r"(?:ligar|desligar|acender|apagar|ativar|desativar|tocar|abrir|fechar)\b",
+    re.IGNORECASE,
+)
 
 # Regex para DESLIGAR (prioritário sobre ligar, com limites de palavra \b)
 RE_DESLIGAR = re.compile(r'\b(desligar(?:\s+a)?|apagar(?:\s+a)?|desativar(?:\s+a)?|desliga(?:\s+a)?|apaga(?:\s+a)?|desativa(?:\s+a)?|fechar(?:\s+a)?|fecha(?:\s+a)?)\b', re.IGNORECASE)
@@ -250,7 +261,8 @@ _RE_NON_HA_OBJECT = re.compile(
 _RE_NOT_DIRECT_ACTUATION = re.compile(
     r"\b(lembr(?:a|ar|e)|esquec(?:e|er|a)|memoriz|anot(?:a|ar|e)|guard(?:a|ar|e)|"
     r"tenho\s+que|tinha\s+que|preciso\s+(?:ligar|desligar|apagar|acender)|"
-    r"que\s+horas|quando\s+eu|se\s+(?:tiver|estiver|fizer|passar))\b",
+    r"que\s+horas|quando\s+eu|se\s+(?:tiver|estiver|fizer|passar)|"
+    r"(?:vou|vamos|pretendo|quero)\s+(?:ligar|desligar|apagar|acender))\b",
     re.IGNORECASE,
 )
 _RE_COMPOUND_SPLIT = re.compile(
@@ -271,6 +283,31 @@ def _match_target_device(texto: str) -> Optional[str]:
             return canonico
 
     return None
+
+
+def _find_action_end(texto: str) -> Optional[int]:
+    """Retorna a posição final do primeiro verbo de ação encontrado."""
+    match = None
+    for regex in (RE_DESLIGAR, RE_LIGAR, RE_TOGGLE):
+        encontrado = regex.search(texto)
+        if encontrado and (match is None or encontrado.start() < match.start()):
+            match = encontrado
+    return match.end() if match else None
+
+
+def _match_target_device_apos_acao(texto: str) -> Optional[str]:
+    """
+    Resolve o dispositivo priorizando o trecho POSTERIOR ao verbo de ação, e só então
+    a frase inteira. Corrige o caso "a luz da sala está queimada, liga a da varanda",
+    em que o parser antigo escolhia o primeiro dispositivo mencionado (a sala).
+    """
+    action_end = _find_action_end(texto)
+    if action_end is not None:
+        trecho = texto[action_end:].strip()
+        achado = _match_target_device(trecho) if trecho else None
+        if achado:
+            return achado
+    return _match_target_device(texto)
 
 
 def parse_home_assistant_local(
@@ -319,8 +356,8 @@ def parse_home_assistant_local(
         elif action == "turn_on" or "ligar" in texto or "liga" in texto:
             return {"action": "trigger", "target_name": "ligar ar condicionado", "parameters": {}}
 
-    # 3. Identificar dispositivo ou automação
-    target_name = _match_target_device(texto)
+    # 3. Identificar dispositivo ou automação (prioriza o alvo citado após o verbo)
+    target_name = _match_target_device_apos_acao(texto)
 
     # 4. Resolução anafórica contextual ("acende/apaga ela", "pode apagar por favor")
     #    Exige que não haja objeto estranho ('forno', 'música') e que a frase seja uma ação

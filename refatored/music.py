@@ -51,6 +51,10 @@ def _write_json_atomically(path: str, payload: Dict[str, Any]) -> None:
             os.fsync(temporary_file.fileno())
             temporary_path = temporary_file.name
 
+        try:
+            os.chmod(temporary_path, 0o600)
+        except OSError:
+            pass
         os.replace(temporary_path, destination)
         temporary_path = None
     finally:
@@ -99,6 +103,16 @@ RE_MUSIC_PLAY = re.compile(
 )
 
 
+# Negação aplicada a comandos de música ("não para a música", "não quero parar")
+RE_MUSIC_NEGACAO = re.compile(
+    r"\bn(?:ã|a)o\s+"
+    r"(?:(?:precis\w*|quer\w*|vou|vai|vamos|deve\w*|pode\w*|pra|para)\s+)*"
+    r"(?:parar|para|pausar|pause|pare|interromper|pular|passar|avan[çc]ar|"
+    r"tocar|toca|coloca|reproduzir|iniciar)\b",
+    re.IGNORECASE,
+)
+
+
 def parse_music_local(mensagem: str) -> Optional[str]:
     """
     Parser determinístico local para comandos de música.
@@ -109,6 +123,11 @@ def parse_music_local(mensagem: str) -> Optional[str]:
         return None
 
     texto = mensagem.lower().strip()
+
+    # Comando negado não deve acionar o player ("não para a música", "não pare")
+    if RE_MUSIC_NEGACAO.search(texto):
+        logger.info("Comando de música negado detectado; ignorando por segurança: '%s'", mensagem)
+        return None
 
     # Checar Parar primeiro
     if RE_MUSIC_STOP.search(texto):
@@ -205,25 +224,19 @@ class MusicPlayer:
                 if not song_id:
                     continue
 
-                # URL de streaming autenticada com token/salt
-                auth = self._generate_auth_params()
-                stream_url = (
-                    f"{NAVIDROME_API_URL}/rest/stream.view?"
-                    f"u={auth['u']}&t={auth['t']}&s={auth['s']}&v={auth['v']}&c={auth['c']}&f=mp3&id={song_id}"
-                )
-
+                # SEGURANÇA: NÃO persistimos a URL de streaming (que carrega token/salt,
+                # ou seja, uma credencial reutilizável do Navidrome). Guardamos apenas o ID
+                # e montamos a URL autenticada no momento da reprodução.
                 playlist.append({
                     "id": song_id,
                     "title": s.get("title") or "Desconhecida",
                     "artist": s.get("artist") or "Desconhecido",
                     "album": s.get("album") or "Desconhecido",
-                    "url": stream_url
                 })
 
             if playlist:
-                # Gravação segura do JSON
-                with open(PLAYLIST_FILE, "w", encoding="utf-8") as f:
-                    json.dump(playlist, f, ensure_ascii=False, indent=2)
+                # Escrita atômica + permissão 0600
+                _write_json_atomically(PLAYLIST_FILE, playlist)
                 logger.info(f"Playlist atualizada com sucesso: {len(playlist)} músicas.")
                 return playlist
 
@@ -246,6 +259,9 @@ class MusicPlayer:
                                     continue
                                 location = track.get("url")
                                 if not isinstance(location, str) or not location.strip():
+                                    # Playlist nova guarda apenas o 'id' do Navidrome
+                                    if track.get("id"):
+                                        valid_tracks.append(track)
                                     continue
                                 location = location.strip()
                                 try:
@@ -271,6 +287,20 @@ class MusicPlayer:
                 except Exception as e:
                     logger.debug(f"Erro ao ler cache {path}: {e}")
         return []
+
+    def _build_stream_url(self, song: Dict[str, Any]) -> Optional[str]:
+        """Monta a URL de streaming autenticada em tempo de execução (token efêmero)."""
+        song_id = song.get("id")
+        if song_id and NAVIDROME_API_URL and NAVIDROME_USER and NAVIDROME_PASSWORD:
+            auth = self._generate_auth_params()
+            return (
+                f"{NAVIDROME_API_URL}/rest/stream.view?"
+                f"u={auth['u']}&t={auth['t']}&s={auth['s']}&v={auth['v']}&c={auth['c']}&f=mp3&id={song_id}"
+            )
+        legacy_url = song.get("url")
+        if isinstance(legacy_url, str) and legacy_url.strip():
+            return legacy_url.strip()
+        return None
 
     def _stop_process_internal(self):
         """Para o processo de áudio com encerramento gracioso e timeout."""
@@ -311,7 +341,10 @@ class MusicPlayer:
             song = random.choice(playlist)
             song["title"] = song.get("title") or "Desconhecida"
             self._current_song = song
-            url = song.get("url")
+            url = self._build_stream_url(song)
+            if not url:
+                logger.error("Faixa sem URL reproduzível (id ausente e cache legado inválido).")
+                return False, "Não consegui montar o endereço da música."
 
             _save_current_song(song)
 

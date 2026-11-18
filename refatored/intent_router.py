@@ -17,6 +17,7 @@ from refatored.config import (
     LLM_ENABLE_TOOLS,
     LLM_STREAM_TTS,
     sanitize_for_log,
+    redact_transcript,
 )
 from refatored.prompts import PROMPT_CONVERSA, PROMPT_HA, PROMPT_CLASSIFICADOR
 from refatored.home_assistant import (
@@ -45,6 +46,7 @@ from refatored.skills import (
     parse_timer_local,
     parse_music_query_local,
     TOOLS_SPEC,
+    TOOLS_SPEC_WEB_SAFE,
     execute_tool_call,
 )
 
@@ -286,7 +288,11 @@ class IntentRouter:
                 "expect_followup": False,
             }
 
-        logger.info(f"=== Processando mensagem: '{mensagem}' (followup={is_followup}) ===")
+        logger.info(
+            "=== Processando mensagem: '%s' (followup=%s) ===",
+            redact_transcript(mensagem, max_chars=120),
+            is_followup,
+        )
 
         # 0. Encerramento natural no modo de conversa contínua ("Não, obrigado!", "Só isso")
         if is_followup and is_dismissal_phrase(mensagem):
@@ -589,11 +595,23 @@ class IntentRouter:
 
         # 4a. Tool Calling seletivo (inclui pesquisar_na_web, memória, timers e controle HA)
         if use_tools and precisa_tools:
+            # Em turnos com conteúdo da internet, só oferecemos ferramentas SEM efeito
+            # físico/persistente: um snippet malicioso não consegue acender/apagar a casa.
+            tools_do_turno = TOOLS_SPEC_WEB_SAFE if eh_busca_web else TOOLS_SPEC
+            nomes_permitidos = {t["function"]["name"] for t in tools_do_turno}
+            if eh_busca_web:
+                logger.info(
+                    "Turno com RAG Web: tool calling restrito a consulta (%s ferramentas).",
+                    len(tools_do_turno),
+                )
             resposta, usou_tool = llm_client.chamar_com_tools(
                 modelo=MODEL_CONVERSA,
                 messages=messages,
-                tools=TOOLS_SPEC,
-                tool_executor=execute_tool_call,
+                tools=tools_do_turno,
+                # O executor valida o nome recebido: só roda o que foi realmente oferecido.
+                tool_executor=lambda nome, args: execute_tool_call(
+                    nome, args, allowed=nomes_permitidos
+                ),
                 fallback_on_unsupported=not eh_busca_web,
             )
 
@@ -614,7 +632,7 @@ class IntentRouter:
                     static_system_prompt=PROMPT_CONVERSA,
                     user_message=mensagem,
                     rag_facts=fatos_relevantes,
-                    ha_context_hint=contexto_web,
+                    external_context=contexto_web,
                 )
                 resposta = chamar_modelo(
                     MODEL_CONVERSA,
@@ -643,7 +661,7 @@ class IntentRouter:
                 static_system_prompt=PROMPT_CONVERSA,
                 user_message=mensagem,
                 rag_facts=fatos_relevantes,
-                ha_context_hint=contexto_web,
+                external_context=contexto_web,
             )
 
         # 3b. Conversa direta com Streaming por Frase Completa (menor latência até a voz sair)

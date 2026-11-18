@@ -6,6 +6,7 @@ import tempfile
 
 from refatored.config import (
     WAKE_WORD,
+    redact_transcript,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,9 +62,17 @@ class SpeechInputManager:
 
     def __init__(self):
         self._recognizer = None
-        self._whisper_model = None
+        self._backend = None
         self._sr_module = None
         self._initialized = False
+
+    # ------------------------------------------------------------------
+    # BACKENDS DE TRANSCRIÇÃO (google)
+    # ------------------------------------------------------------------
+
+    def _select_backend(self) -> str:
+        """Resolve o backend efetivo conforme STT_PROVIDER, com degradação avisada."""
+        return "google"
 
     def initialize(self) -> bool:
         """Inicializa módulos de áudio e modelo Whisper."""
@@ -81,6 +90,19 @@ class SpeechInputManager:
         except ImportError:
             logger.error("speech_recognition não instalado.")
             return False
+
+        # Resolve o backend de transcrição já na inicialização (sem latência no 1º comando)
+        self._backend = self._select_backend()
+
+        if self._backend == "google":
+            logger.warning(
+                "STT em NUVEM ativo (backend='google'): o áudio do microfone é enviado "
+                "ao Google Speech Recognition. Escolha consciente e documentada — veja "
+                "STT_PROVIDER no .env. Nenhum texto é gravado em log por padrão "
+                "(AURORA_LOG_TRANSCRIPTS=false)."
+            )
+        else:
+            logger.info("STT local ativo (backend='%s').", self._backend)
 
         self._initialized = True
         return True
@@ -103,32 +125,9 @@ class SpeechInputManager:
         Transcreve o áudio gravado.
         CORREÇÃO CRÍTICA: Garante que arquivos temporários são SEMPRE excluídos em bloco finally.
         """
-        if self._whisper_model:
-            temp_path = None
-            try:
-                # Criar arquivo temporário de forma segura
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                    temp_path = f.name
-                    f.write(audio_data.get_wav_data())
 
-                segments, _ = self._whisper_model.transcribe(
-                    temp_path,
-                    language="pt",
-                    beam_size=1
-                )
-                texto = " ".join([seg.text for seg in segments]).strip()
-                return texto
-            except Exception as e:
-                logger.error(f"Erro na transcrição Whisper: {e}")
-                raise
-            finally:
-                if temp_path and os.path.exists(temp_path):
-                    try:
-                        os.remove(temp_path)
-                    except Exception:
-                        pass
-        else:
-            # Fallback Google Speech
+        if self._backend == "google":
+            # Backend em nuvem (Google Speech): o áudio SAI da rede local
             try:
                 return self._recognizer.recognize_google(audio_data, language="pt-BR").strip()
             except Exception as e:
@@ -161,7 +160,10 @@ class SpeechInputManager:
         try:
             texto = self.transcribe_audio(audio)
             if texto:
-                logger.debug(f"Texto detectado na escuta de ativação: '{texto}'")
+                logger.debug(
+                    "Texto detectado na escuta de ativação: '%s'",
+                    redact_transcript(texto, max_chars=120),
+                )
                 if RE_WAKE_WORD.search(texto):
                     logger.info("Wake word 'aurora' reconhecida!")
                     return True
@@ -196,7 +198,8 @@ class SpeechInputManager:
 
         try:
             texto = self.transcribe_audio(audio)
-            logger.info(f"Comando transcrito: '{texto}'")
+            # LGPD: o conteúdo falado só vai para o log com AURORA_LOG_TRANSCRIPTS=true
+            logger.info("Comando transcrito: '%s'", redact_transcript(texto, max_chars=200))
             return texto
         except sr.UnknownValueError:
             logger.debug("Não foi possível decodificar o áudio.")

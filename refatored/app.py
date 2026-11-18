@@ -8,6 +8,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import time
+import signal
 import logging
 import argparse
 
@@ -47,6 +48,23 @@ def _shutdown_services():
     """Encerra reprodução de música e timers pendentes com segurança."""
     music_player.stop()
     timer_manager.cancel_all()
+
+
+def _install_signal_handlers():
+    """
+    Garante desligamento limpo quando o systemd envia SIGTERM (systemctl stop/restart).
+    Sem isso, o processo morre deixando o mpg123 tocando e timers órfãos.
+    """
+    def _handle(signum, _frame):
+        logger.info("Sinal %s recebido; encerrando serviços com segurança...", signum)
+        _shutdown_services()
+        raise SystemExit(0)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _handle)
+        except (ValueError, OSError):
+            logger.debug("Não foi possível registrar handler para o sinal %s.", sig)
 
 
 def _is_continuous_conversation_enabled() -> bool:
@@ -176,6 +194,7 @@ def main():
 
     # Configurar logging padronizado
     setup_logging(level=logging.INFO)
+    _install_signal_handlers()
     print_banner()
 
     # Validar e exibir status das configurações

@@ -10,13 +10,9 @@ python-dotenv>=1.0,<2
 # --- Entrada de voz ------------------------------------------------------------
 SpeechRecognition>=3.10,<4
 PyAudio>=0.2.14            # exige: sudo apt install portaudio19-dev
-# STT local (obrigatório para privacidade — ver §4.2 do relatório).
-# No Orange Pi use compute_type="int8" e cpu_threads=2 (já configurado em config.py).
-faster-whisper>=1.0,<2
+
 # Alternativa mais leve para wake word contínua (recomendada — PERF-02):
 # openwakeword>=0.6
-# Alternativa de STT streaming de baixo consumo (PERF-01):
-# vosk>=0.3.45
 
 # --- Síntese de voz -----------------------------------------------------------
 google-cloud-texttospeech>=2.16,<3     # TTS_PROVIDER=google (Chirp3-HD)

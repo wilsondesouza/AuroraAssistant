@@ -37,6 +37,7 @@ venv/
 .coverage
 htmlcov/
 scripts/
+refatored/speech_input_copy.py
 
 # --- Sistema / IDE -------------------------------------------------------------
 .DS_Store

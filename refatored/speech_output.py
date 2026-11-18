@@ -29,6 +29,10 @@ from refatored.tts_client import (
 logger = logging.getLogger(__name__)
 _tts_volume_lock = threading.RLock()
 
+# Um único barramento de áudio: evita que o bip de confirmação, o TTS e o áudio de
+# contingência toquem ao mesmo tempo (disputando o mesmo dispositivo ALSA).
+_playback_lock = threading.RLock()
+
 
 def _build_mpg123_command(target: str) -> list[str]:
     """Monta a linha de comando do mpg123 respeitando drivers e dispositivos configurados."""
@@ -181,7 +185,7 @@ def play_audio_file(caminho: str, blocking: bool = False) -> bool:
         logger.warning(f"Arquivo de áudio não encontrado: '{caminho}'")
         return False
 
-    def _play() -> bool:
+    def _play_unlocked() -> bool:
         is_wav = caminho.lower().endswith(".wav")
         players = []
         if is_wav and shutil.which("aplay"):
@@ -242,6 +246,10 @@ def play_audio_file(caminho: str, blocking: bool = False) -> bool:
         except (OSError, subprocess.SubprocessError) as error:
             logger.error("Erro ao reproduzir áudio '%s': %s", caminho, error)
             return False
+
+    def _play() -> bool:
+        with _playback_lock:
+            return _play_unlocked()
 
     if blocking:
         return _play()

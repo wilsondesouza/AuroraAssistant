@@ -143,8 +143,17 @@ class MemoryStore:
 
     def _get_connection(self) -> sqlite3.Connection:
         path_obj = Path(self._db_path)
+        # O banco guarda dados pessoais e de saúde da família: diretório 700 e arquivo 600
         path_obj.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(path_obj.parent, 0o700)
+        except OSError:
+            pass
         conn = sqlite3.connect(str(path_obj), timeout=5.0)
+        try:
+            os.chmod(path_obj, 0o600)
+        except OSError:
+            pass
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
@@ -240,6 +249,13 @@ class MemoryStore:
     def add_memory(self, content: str, category: str = "geral") -> int:
         """Salva um fato/lembrete permanente na Memória da Casa e retorna o ID."""
         texto = (content or "").strip().rstrip(".")
+        if not texto:
+            raise ValueError("Conteúdo da memória não pode ser vazio.")
+
+        # Higienização: a memória é reinserida no prompt da LLM depois — nada de
+        # caracteres de controle, quebras de linha ou textos gigantes (anti-poisoning).
+        texto = re.sub(r"[\x00-\x1f\x7f]", " ", texto)
+        texto = re.sub(r"\s+", " ", texto).strip()[:500]
         if not texto:
             raise ValueError("Conteúdo da memória não pode ser vazio.")
 

@@ -154,6 +154,13 @@ SMARTLUME_STATUS_FILE = os.getenv(
 
 # Reconhecimento de Voz & Conversa Contínua (Follow-up sem Wake Word)
 WAKE_WORD = os.getenv("WAKE_WORD", "aurora").lower()
+
+# Privacidade de logs: grava o TEXTO da fala do usuário apenas se explicitamente ativado
+LOG_TRANSCRIPTS = os.getenv("AURORA_LOG_TRANSCRIPTS", "false").lower().strip() in (
+    "1", "true", "yes", "on"
+)
+
+# Motor de STT. Default 'google' preserva o comportamento atual (SpeechRecognition),
 CONTINUOUS_CONVERSATION = os.getenv("CONTINUOUS_CONVERSATION", "true").lower().strip() in (
     "1", "true", "yes", "on"
 )
@@ -184,7 +191,15 @@ WEB_SEARCH_FALLBACK_PROVIDERS = os.getenv(
     "WEB_SEARCH_FALLBACK_PROVIDERS", "serper,tavily,free"
 ).strip()
 WEB_SEARCH_MAX_RESULTS = max(1, min(6, int(os.getenv("WEB_SEARCH_MAX_RESULTS", "4"))))
-WEB_SEARCH_TIMEOUT = int(os.getenv("WEB_SEARCH_TIMEOUT", "8"))
+WEB_SEARCH_TIMEOUT = int(os.getenv("WEB_SEARCH_TIMEOUT", "6"))
+# Orçamento TOTAL de tempo por pesquisa (todos os provedores somados).
+WEB_SEARCH_TOTAL_DEADLINE = float(os.getenv("WEB_SEARCH_TOTAL_DEADLINE", "7.0"))
+# Tamanho máximo aceito de uma resposta HTTP de buscador/RSS (proteção de RAM no H6).
+WEB_SEARCH_MAX_BYTES = int(os.getenv("WEB_SEARCH_MAX_BYTES", str(2 * 1024 * 1024)))
+# Filtro de conteúdo: evita que resultados impróprios sejam falados para crianças/idosos.
+WEB_SEARCH_SAFE = os.getenv("WEB_SEARCH_SAFE", "true").lower().strip() in (
+    "1", "true", "yes", "on"
+)
 SERPER_API_KEY = os.getenv("SERPER_API_KEY", "").strip()
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
 
@@ -206,23 +221,92 @@ LLM_STREAM_MIN_CHARS = max(20, int(os.getenv("LLM_STREAM_MIN_CHARS", "55")))
 # LOGGING E SANITIZAÇÃO
 # ==========================================
 
+_SENSITIVE_KEYS = (
+    r"senha|password|passwd|pwd|token|secret|api[_-]?key|apikey|access[_-]?key|"
+    r"authorization|auth|credential|credencial|xi-api-key|x-goog-api-key|x-api-key|"
+    r"api_key|appid|ha_token|navidrome_password|elevenlabs_api_key|openweather_key|"
+    r"groq_api_key|gemini_api_key|cerebras_api_key|openrouter_key|llm_api_key|"
+    r"serper_api_key|tavily_api_key"
+)
+
+# Formatos longos e reconhecíveis de credenciais (JWT, chaves Google, Groq, OpenRouter, Tavily)
+_RE_SECRET_BLOB = re.compile(
+    r"(?:eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}"  # JWT
+    r"|AIza[0-9A-Za-z_-]{20,}"                                        # Google API key
+    r"|gsk_[A-Za-z0-9]{20,}"                                          # Groq
+    r"|tvly-[A-Za-z0-9_-]{10,}"                                       # Tavily
+    r"|sk-[A-Za-z0-9_-]{16,})"                                        # OpenAI/OpenRouter/ElevenLabs
+)
+
+
 def sanitize_for_log(text: str) -> str:
-    """Remove tokens, senhas e chaves sensíveis de mensagens para log."""
+    """
+    Remove tokens, senhas, chaves e identificadores sensíveis de mensagens para log.
+
+    Cobre: parâmetros de query (Subsonic `p`, `t`, `s`, `u`; OpenWeather `appid`),
+    cabeçalhos `Authorization`, chaves em formato `CHAVE=valor` / `'chave': 'valor'`,
+    segredos declarados em linguagem natural e blobs reconhecíveis (JWT, AIza…, gsk_…,
+    tvly-…, sk-…).
+    """
     if not text:
         return ""
-    # Ocultar valores de senha ou token em URLs
-    cleaned = re.sub(r'([?&](?:p|password|t|token|key|appid)=)[^&]+', r'\1***', text, flags=re.IGNORECASE)
-    # Ocultar Authorization Bearer
-    cleaned = re.sub(r'(Bearer\s+)[A-Za-z0-9\-_.]+', r'\1***', cleaned, flags=re.IGNORECASE)
-    # Ocultar xi-api-key (ElevenLabs), x-goog-api-key (Gemini), X-API-KEY (Serper) e chaves tvly- (Tavily)
+
+    cleaned = str(text)
+
+    # 1. Parâmetros sensíveis em URLs (Subsonic usa 'u' para usuário e 's' para salt)
     cleaned = re.sub(
-        r'((?:xi-api-key|x-goog-api-key|x-api-key|api_key)["\']?\s*[:=]\s*["\']?)[A-Za-z0-9\-_.]+',
-        r'\1***',
+        r"([?&](?:p|u|t|s|token|password|passwd|key|appid|api_key)=)[^&\s'\"]+",
+        r"\1***",
         cleaned,
         flags=re.IGNORECASE,
     )
-    cleaned = re.sub(r'\btvly-[A-Za-z0-9\-_]+\b', 'tvly-***', cleaned)
+
+    # 2. Authorization: Bearer / Basic
+    cleaned = re.sub(
+        r"(Bearer\s+|Basic\s+)[A-Za-z0-9\-_.=+/]+",
+        r"\1***",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    # 3. Pares chave/valor sensíveis em texto, dicionários Python ou JSON
+    cleaned = re.sub(
+        rf"((?:{_SENSITIVE_KEYS})[\"']?\s*[:=]\s*[\"']?)[^\s\"',;}}]+",
+        r"\1***",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    # 4. Segredos declarados em linguagem natural ("a senha é X", "o token do wifi é Y")
+    cleaned = re.sub(
+        r"\b(senha|password|passwd|token|chave|credencial)\b([^.,;!?\n]{0,40}?)(?:é|e|:|=)\s+\S+",
+        r"\1\2<segredo oculto>",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    # 5. Blobs de credencial mesmo sem rótulo (ex: chave colada no meio de uma mensagem)
+    cleaned = _RE_SECRET_BLOB.sub("***", cleaned)
+
     return cleaned
+
+
+def redact_transcript(texto: str, max_chars: int = 0) -> str:
+    """
+    Prepara uma transcrição de voz (ou uma consulta de busca) para log.
+
+    Por padrão (AURORA_LOG_TRANSCRIPTS=false) NÃO grava o conteúdo da fala, apenas
+    o tamanho — evita deixar senhas, dados de saúde e conversas da família em texto
+    claro nos logs/journal. Ative com AURORA_LOG_TRANSCRIPTS=true para depurar.
+    """
+    if not texto:
+        return ""
+    if not LOG_TRANSCRIPTS:
+        return f"<conteúdo oculto: {len(texto)} caracteres>"
+    trecho = sanitize_for_log(texto)
+    if max_chars and len(trecho) > max_chars:
+        return trecho[:max_chars] + "..."
+    return trecho
 
 def setup_logging(level=logging.INFO):
     """Configura logging formatado e padronizado para todo o assistente."""

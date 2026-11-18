@@ -489,11 +489,49 @@ TOOLS_SPEC: List[Dict[str, Any]] = [
 ]
 
 
-def execute_tool_call(tool_name: str, raw_arguments: Any) -> str:
+# Tool calling em turnos que recebem conteúdo da internet (não confiável).
+# Política: nenhuma ferramenta com EFEITO FÍSICO ou de persistência é oferecida junto
+# com texto de terceiros — evita a "tríade letal" (entrada não confiável + tools + sem
+# confirmação humana). Consulta continua liberada.
+_ACOES_SEM_EFEITO = {
+    "consultar_clima",
+    "consultar_hora_atual",
+    "consultar_musica_atual",
+    "consultar_estado_casa",
+    "buscar_memoria_casa",
+    "pesquisar_na_web",
+}
+
+TOOLS_SPEC_WEB_SAFE: List[Dict[str, Any]] = [
+    tool for tool in TOOLS_SPEC
+    if tool["function"]["name"] in _ACOES_SEM_EFEITO
+]
+
+
+def execute_tool_call(
+    tool_name: str,
+    raw_arguments: Any,
+    allowed: Optional[set] = None,
+) -> str:
     """
     Executa de forma segura uma ferramenta solicitada pela LLM e retorna string de resultado.
     Todas as chamadas residenciais passam obrigatoriamente pela whitelist do DEVICE_REGISTRY.
+
+    `allowed` (defesa em profundidade): se informado, apenas os nomes de ferramenta
+    listados podem ser executados. Isso é necessário porque o nome da ferramenta chega
+    no payload do modelo — restringir somente o schema oferecido NÃO impede um modelo
+    (ou um payload manipulado) de emitir o nome de uma ferramenta que não foi oferecida.
     """
+    if allowed is not None and tool_name not in allowed:
+        logger.warning(
+            "Tool call BLOQUEADA: '%s' não foi oferecida neste turno (permitidas: %s).",
+            tool_name, sorted(allowed),
+        )
+        return (
+            f"Ferramenta '{tool_name}' não está disponível neste contexto. "
+            "Responda ao usuário sem executar ações."
+        )
+
     if isinstance(raw_arguments, str):
         try:
             args = json.loads(raw_arguments) if raw_arguments.strip() else {}
@@ -573,7 +611,7 @@ def execute_tool_call(tool_name: str, raw_arguments: Any) -> str:
             return "Memórias encontradas: " + " | ".join(achados)
 
         elif tool_name == "pesquisar_na_web":
-            consulta = str(args.get("consulta", "")).strip()
+            consulta = str(args.get("consulta", "")).strip()[:300]
             if not consulta:
                 return "Consulta de busca vazia."
             return web_search_client.buscar_contexto_formatado(consulta)

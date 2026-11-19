@@ -60,6 +60,7 @@ MODEL_HA = os.getenv("MODEL_HA", "google/gemma-3-12b-it:free")
 
 # Home Assistant
 HA_URL = os.getenv("HA_URL", "http://localhost:8123").rstrip("/")
+HA_CA_BUNDLE = os.getenv("HA_CA_BUNDLE", "").strip()  # PEM público exclusivo deste cliente HA
 HA_TOKEN = os.getenv("HA_TOKEN", "")
 HA_TIMEOUT = int(os.getenv("HA_TIMEOUT", "8"))
 HEADERS_HA = {

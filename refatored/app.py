@@ -19,6 +19,7 @@ from refatored.config import (
     CONTINUOUS_MAX_TURNS,
     CONTINUOUS_LISTEN_TIMEOUT,
 )
+from refatored.domus_bridge import TURN_LOCK, running_bridge, stop_mobile_intake
 from refatored.speech_input import speech_input
 from refatored.speech_output import play_confirmation, play_error, falar
 from refatored.intent_router import intent_router
@@ -46,6 +47,7 @@ def configure_output_encoding():
 
 def _shutdown_services():
     """Encerra reprodução de música e timers pendentes com segurança."""
+    stop_mobile_intake()  # um POST não pode recriar um timer/player após a limpeza
     music_player.stop()
     timer_manager.cancel_all()
 
@@ -129,7 +131,8 @@ def run_cli_mode():
                 _shutdown_services()
                 break
 
-            resultado = intent_router.processar_mensagem(comando, is_followup=em_followup)
+            with TURN_LOCK:
+                resultado = intent_router.processar_mensagem(comando, is_followup=em_followup)
             print(f"[Aurora]: {resultado.get('message')}")
             em_followup = bool(
                 _is_continuous_conversation_enabled() and resultado.get("expect_followup")
@@ -160,15 +163,22 @@ def run_voice_mode():
     while True:
         try:
             if speech_input.aguardar_ativacao():
-                play_confirmation(blocking=True)
-                logger.info("Escutando comando do usuário...")
-                comando = speech_input.escutar_comando()
+                # Não abrir o microfone sobre uma resposta móvel; não segurar o lock
+                # durante a espera ociosa pela palavra de ativação.
+                if not TURN_LOCK.acquire(blocking=False):
+                    continue
+                try:
+                    play_confirmation(blocking=True)
+                    logger.info("Escutando comando do usuário...")
+                    comando = speech_input.escutar_comando()
 
-                if comando:
-                    resultado = intent_router.processar_mensagem(comando, is_followup=False)
-                    _executar_loop_followup_voz(resultado)
-                else:
-                    logger.debug("Nenhum comando detectado após ativação.")
+                    if comando:
+                        resultado = intent_router.processar_mensagem(comando, is_followup=False)
+                        _executar_loop_followup_voz(resultado)
+                    else:
+                        logger.debug("Nenhum comando detectado após ativação.")
+                finally:
+                    TURN_LOCK.release()
             else:
                 time.sleep(0.15)
 
@@ -204,10 +214,11 @@ def main():
         marcador = "✓" if ok else "✗"
         logger.info(f"  [{marcador}] {servico.upper()}")
 
-    if args.cli:
-        run_cli_mode()
-    else:
-        run_voice_mode()
+    with running_bridge():
+        if args.cli:
+            run_cli_mode()
+        else:
+            run_voice_mode()
 
 
 if __name__ == "__main__":

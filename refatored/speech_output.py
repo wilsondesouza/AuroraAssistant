@@ -33,6 +33,20 @@ _tts_volume_lock = threading.RLock()
 # contingência toquem ao mesmo tempo (disputando o mesmo dispositivo ALSA).
 _playback_lock = threading.RLock()
 
+# Preferência de resposta do turno, não é um mute global do barramento.
+_response = threading.local()
+
+
+@contextmanager
+def text_only_response():
+    """Somente a resposta síncrona deste turno. Outra thread (timer) continua audível."""
+    previous = getattr(_response, "quiet", False)
+    _response.quiet = True
+    try:
+        yield
+    finally:
+        _response.quiet = previous
+
 
 def _build_mpg123_command(target: str) -> list[str]:
     """Monta a linha de comando do mpg123 respeitando drivers e dispositivos configurados."""
@@ -260,11 +274,15 @@ def play_audio_file(caminho: str, blocking: bool = False) -> bool:
 
 def play_confirmation(blocking: bool = False):
     """Toca o som de confirmação; permite aguardar antes de abrir o microfone."""
+    if getattr(_response, "quiet", False):
+        return
     play_audio_file(CONFIRMATION_SOUND, blocking=blocking)
 
 
 def play_error():
     """Toca som de erro/falha."""
+    if getattr(_response, "quiet", False):
+        return
     play_audio_file(ERROR_SOUND, blocking=True)
     
 def play_falha_tts():
@@ -430,9 +448,12 @@ tts_manager = TextToSpeechManager()
 
 def falar(texto: str):
     """Função utilitária global para fala da Aurora."""
-    tts_manager.falar(texto)
+    if not getattr(_response, "quiet", False):
+        tts_manager.falar(texto)
 
 
 def falar_em_stream(frases_iter: Iterable[str]) -> str:
     """Função utilitária global para fala em streaming por frases completas."""
+    if getattr(_response, "quiet", False):
+        return " ".join(s.strip() for s in frases_iter if s and s.strip())
     return tts_manager.falar_em_stream(frases_iter)

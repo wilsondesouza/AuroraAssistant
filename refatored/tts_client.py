@@ -272,6 +272,39 @@ class TTSClient:
     def get_active_provider(self) -> str:
         return self.normalize_provider(os.getenv("TTS_PROVIDER", TTS_PROVIDER))
 
+    def describe_model(self, provider: Optional[str] = None) -> Optional[dict]:
+        """Nomes públicos, resolvidos da mesma forma que na síntese. Sem credenciais."""
+        p = provider or self.get_active_provider()
+        if p == "google":
+            # O pedido Google seleciona uma voz, não um ID de modelo separado.
+            return {"provider": p, "model": "seleção por voz",
+                    "voice": os.getenv("TTS_VOICE_NAME", TTS_VOICE_NAME).strip()}
+        if p == "elevenlabs":
+            voice_id = (
+                os.getenv("ELEVENLABS_VOICE_ID")
+                or ELEVENLABS_VOICE_ID
+                or TTS_PROVIDER_PRESETS["elevenlabs"]["default_voice_id"]
+            ).strip()
+            model_id = (
+                os.getenv("ELEVENLABS_MODEL_ID")
+                or ELEVENLABS_MODEL_ID
+                or TTS_PROVIDER_PRESETS["elevenlabs"]["default_model_id"]
+            ).strip()
+            return {"provider": p, "model": model_id, "voice": voice_id}
+        if p == "openrouter":
+            model = (
+                os.getenv("OPENROUTER_TTS_MODEL")
+                or OPENROUTER_TTS_MODEL
+                or TTS_PROVIDER_PRESETS["openrouter"]["default_model"]
+            ).strip()
+            voice = (
+                os.getenv("OPENROUTER_TTS_VOICE")
+                or OPENROUTER_TTS_VOICE
+                or TTS_PROVIDER_PRESETS["openrouter"]["default_voice"]
+            ).strip()
+            return {"provider": p, "model": model, "voice": voice}
+        return None
+
     def get_provider_chain(self, provider_override: Optional[str] = None) -> List[str]:
         """
         Monta a lista ordenada e sem duplicatas de provedores a tentar:
@@ -327,7 +360,7 @@ class TTSClient:
         if not self._ensure_google_client():
             return None
 
-        voice_name = os.getenv("TTS_VOICE_NAME", TTS_VOICE_NAME).strip()
+        voice_name = self.describe_model("google")["voice"]
         lang_code = os.getenv("TTS_LANGUAGE_CODE", TTS_LANGUAGE_CODE).strip()
 
         try:
@@ -374,16 +407,8 @@ class TTSClient:
             logger.warning("Chave ELEVENLABS_API_KEY ausente no ambiente.")
             return None
 
-        voice_id = (
-            os.getenv("ELEVENLABS_VOICE_ID")
-            or ELEVENLABS_VOICE_ID
-            or TTS_PROVIDER_PRESETS["elevenlabs"]["default_voice_id"]
-        ).strip()
-        model_id = (
-            os.getenv("ELEVENLABS_MODEL_ID")
-            or ELEVENLABS_MODEL_ID
-            or TTS_PROVIDER_PRESETS["elevenlabs"]["default_model_id"]
-        ).strip()
+        primary = self.describe_model("elevenlabs")
+        voice_id, model_id = primary["voice"], primary["model"]
         output_format = (
             os.getenv("ELEVENLABS_OUTPUT_FORMAT")
             or ELEVENLABS_OUTPUT_FORMAT
@@ -513,16 +538,8 @@ class TTSClient:
             or OPENROUTER_TTS_URL
             or TTS_PROVIDER_PRESETS["openrouter"]["url"]
         ).strip()
-        model = (
-            os.getenv("OPENROUTER_TTS_MODEL")
-            or OPENROUTER_TTS_MODEL
-            or TTS_PROVIDER_PRESETS["openrouter"]["default_model"]
-        ).strip()
-        voice = (
-            os.getenv("OPENROUTER_TTS_VOICE")
-            or OPENROUTER_TTS_VOICE
-            or TTS_PROVIDER_PRESETS["openrouter"]["default_voice"]
-        ).strip()
+        primary = self.describe_model("openrouter")
+        model, voice = primary["model"], primary["voice"]
         speed = float(os.getenv("OPENROUTER_TTS_SPEED", str(OPENROUTER_TTS_SPEED)))
         instructions = os.getenv(
             "OPENROUTER_TTS_INSTRUCTIONS", OPENROUTER_TTS_INSTRUCTIONS

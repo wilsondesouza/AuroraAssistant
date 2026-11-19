@@ -1,6 +1,8 @@
 import re
 import json
 import logging
+import os
+from urllib.parse import urlsplit
 from typing import Dict, Any, Optional, Tuple, List
 
 try:
@@ -8,7 +10,7 @@ try:
 except ImportError:
     requests = None
 
-from refatored.config import HA_URL, HEADERS_HA, HA_TIMEOUT, sanitize_for_log
+from refatored.config import HA_CA_BUNDLE, HA_URL, HEADERS_HA, HA_TIMEOUT, sanitize_for_log
 from refatored.conversation_memory import conversation_memory
 
 logger = logging.getLogger(__name__)
@@ -669,6 +671,43 @@ def resolver_comando(intencao: Dict[str, Any]) -> Dict[str, Any]:
 # EXECUÇÃO HTTP NO HOME ASSISTANT
 # ==========================================
 
+class HAConfigError(ValueError):
+    pass
+
+
+def _transport_options(*, authenticated=True):
+    """Escopo HA apenas: nunca alterar confiança de Navidrome, LLM, Web ou TTS."""
+    try:
+        uri = urlsplit(HA_URL)
+        _ = uri.port  # validar inclusive uma porta explícita inválida
+    except ValueError as exc:
+        raise HAConfigError("HA_URL inválida.") from exc
+    if (uri.scheme not in {'https', 'http'} or not uri.hostname or uri.username is not None
+            or uri.password is not None or uri.query or uri.fragment):
+        raise HAConfigError('Confira HA_URL: use a base HTTPS do Home Assistant.')
+    if uri.scheme == 'http' and (HA_CA_BUNDLE or uri.hostname not in {'localhost', '127.0.0.1', '::1'}):
+        raise HAConfigError('Use HTTPS para o Home Assistant. O token não foi enviado.')
+    if HA_CA_BUNDLE and not (os.path.isabs(HA_CA_BUNDLE) and os.path.isfile(HA_CA_BUNDLE)
+                               and os.access(HA_CA_BUNDLE, os.R_OK)):
+        raise HAConfigError('HA_CA_BUNDLE deve apontar para um arquivo PEM absoluto e legível pelo serviço.')
+    options = dict(headers=HEADERS_HA if authenticated else {}, timeout=HA_TIMEOUT,
+                   verify=HA_CA_BUNDLE or True, allow_redirects=False)
+    if not authenticated:
+        options['auth'] = lambda prepared: prepared  # não deixar ~/.netrc injetar Authorization no diagnóstico
+    if uri.scheme == 'http':
+        # Compatibilidade com o HA local, sem encaminhar HTTP por proxy de ambiente.
+        options['proxies'] = {'http': '', 'all': ''}
+    return options
+
+
+def _trust_failure(exc):
+    if isinstance(exc, HAConfigError):
+        logger.error('Configuração do cliente HA: %s', exc)
+        return str(exc)
+    logger.error('TLS do HA falhou; confira CA, cadeia e SAN de HA_URL. Detalhe: %s', sanitize_for_log(str(exc)))
+    return 'Não consegui validar a conexão TLS com o Home Assistant. Confira a CA e o nome do servidor no Orange Pi.'
+
+
 def executar_comando_ha(comando: Dict[str, Any]) -> Tuple[bool, str]:
     """
     Envia o comando resolvido para a REST API do Home Assistant.
@@ -697,7 +736,7 @@ def executar_comando_ha(comando: Dict[str, Any]) -> Tuple[bool, str]:
         payload.update(data)
 
     url = f"{HA_URL}/api/services/{domain}/{service}"
-    logger.info(f"Enviando para HA: POST {url} | payload={payload}")
+    logger.info("Enviando para HA: serviço %s.%s, entidade %s", domain, service, entity_id)
 
     if requests is None:
         logger.error("Biblioteca 'requests' não instalada.")
@@ -706,9 +745,8 @@ def executar_comando_ha(comando: Dict[str, Any]) -> Tuple[bool, str]:
     try:
         resp = requests.post(
             url,
-            headers=HEADERS_HA,
             json=payload,
-            timeout=HA_TIMEOUT
+            **_transport_options(),
         )
         logger.debug(f"Resposta HA: HTTP {resp.status_code}")
 
@@ -717,6 +755,8 @@ def executar_comando_ha(comando: Dict[str, Any]) -> Tuple[bool, str]:
         else:
             logger.error(f"Erro HA: status={resp.status_code}, corpo={sanitize_for_log(resp.text[:300])}")
             return False, "O Home Assistant retornou um erro ao executar a ação."
+    except (HAConfigError, requests.exceptions.SSLError) as e:
+        return False, _trust_failure(e)
     except requests.exceptions.Timeout:
         logger.error("Timeout ao comunicar com Home Assistant.")
         return False, "Tempo de resposta esgotado no Home Assistant."
@@ -821,7 +861,7 @@ def consultar_estado_dispositivo_ha(nome_dispositivo: str) -> str:
     url = f"{HA_URL}/api/states/{entity_id}"
 
     try:
-        resp = requests.get(url, headers=HEADERS_HA, timeout=HA_TIMEOUT)
+        resp = requests.get(url, **_transport_options())
         if resp.status_code != 200:
             logger.warning(f"Consulta de estado HA retornou HTTP {resp.status_code} para {entity_id}")
             return f"Não consegui conferir o estado de {canonico} no Home Assistant agora."
@@ -851,6 +891,8 @@ def consultar_estado_dispositivo_ha(nome_dispositivo: str) -> str:
             return f"Olha, a {canonico} aparece como indisponível ou sem sinal no Home Assistant agora."
         conversation_memory.record_ha_target(canonico, state=state)
         return f"O estado atual de {canonico} no Home Assistant é {state}."
+    except (HAConfigError, requests.exceptions.SSLError) as e:
+        return _trust_failure(e)
     except Exception as e:
         logger.error(f"Erro ao consultar estado de {entity_id}: {e}")
         return "Tive um probleminha de conexão ao consultar o Home Assistant agora."
@@ -870,7 +912,7 @@ def listar_dispositivos_ligados_ha() -> str:
 
     url = f"{HA_URL}/api/states"
     try:
-        resp = requests.get(url, headers=HEADERS_HA, timeout=HA_TIMEOUT)
+        resp = requests.get(url, **_transport_options())
         if resp.status_code != 200:
             return "Não consegui consultar a lista de estados do Home Assistant agora."
 
@@ -898,6 +940,8 @@ def listar_dispositivos_ligados_ha() -> str:
             return f"Olha, no momento só a {ligados[0]} tá ligada — quer que eu {verbo} ela?"
         lista_txt = ", ".join(ligados[:-1]) + f" e {ligados[-1]}"
         return f"Conferi aqui em casa e estão ligadas: {lista_txt} — quer que eu desligue elas?"
+    except (HAConfigError, requests.exceptions.SSLError) as e:
+        return _trust_failure(e)
     except Exception as e:
         logger.error(f"Erro ao listar estados do Home Assistant: {e}")
         return "Não consegui verificar os dispositivos do Home Assistant no momento."

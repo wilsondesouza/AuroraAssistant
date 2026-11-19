@@ -19,7 +19,7 @@ class TestAppOutput(unittest.TestCase):
             stdout.flush()
 
         banner = stdout_buffer.getvalue().decode("utf-8")
-        self.assertIn("AURORA ASSISTANT 2.0", banner)
+        self.assertIn("AURORA ASSISTANT 2.5", banner)
         self.assertIn("╔", banner)
 
 

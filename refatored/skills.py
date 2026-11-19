@@ -4,7 +4,7 @@ import re
 import time
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional, List, Callable
 
 from refatored.config import CURRENT_SONG_FILE
@@ -202,6 +202,17 @@ class TimerManager:
             except Exception:
                 pass
         return len(ativos)
+
+    def snapshot(self) -> List[Dict[str, Any]]:
+        """Traduz os prazos monotônicos do controlador vivo, sem reagendar alarmes."""
+        with self._lock:
+            now = time.monotonic()
+            utc = datetime.now(timezone.utc)
+            return [
+                {"id": item["id"], "label": item["reason"] or f"Timer #{item['id']}",
+                 "ends_at": (utc + timedelta(seconds=max(0, item["deadline"] - now))).isoformat()}
+                for item in sorted(self._timers.values(), key=lambda t: t["deadline"])
+            ]
 
     def status_message(self) -> str:
         now = time.monotonic()

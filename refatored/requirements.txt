@@ -12,16 +12,16 @@ SpeechRecognition>=3.10,<4
 PyAudio>=0.2.14            # exige: sudo apt install portaudio19-dev
 
 # Alternativa mais leve para wake word contínua (recomendada — PERF-02):
-# openwakeword>=0.6
+openwakeword>=0.6
 
 # --- Síntese de voz -----------------------------------------------------------
 google-cloud-texttospeech>=2.16,<3     # TTS_PROVIDER=google (Chirp3-HD)
 
 # --- Opcionais por feature ----------------------------------------------------
-# feedparser>=6.0        # F-12 notícias por RSS
-# trafilatura>=1.8       # F-17 extração de texto de páginas web
-# icalendar>=5.0         # F-11 agenda via ICS/CalDAV
-# cryptography>=42       # SEC-06 criptografia da Memória da Casa em repouso
+feedparser>=6.0        # F-12 notícias por RSS
+trafilatura>=1.8       # F-17 extração de texto de páginas web
+icalendar>=5.0         # F-11 agenda via ICS/CalDAV
+cryptography>=42       # SEC-06 criptografia da Memória da Casa em repouso
 
 # NOTA: não há dependência de numpy/torch no projeto por decisão de arquitetura
 # (Mini-RAG em Python puro). Mantenha assim: o H6 agradece.

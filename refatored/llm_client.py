@@ -135,6 +135,10 @@ class LLMClient:
                 return preset["default_model_conversa"]
         return model
 
+    def describe_primary_model(self, model: str) -> dict:
+        """Configuração efetiva primária; não afirma qual fallback respondeu."""
+        return {"provider": self.provider, "model": self._adapt_model_name(model, self.provider)}
+
     def _build_headers_and_endpoint(
         self,
         modelo: str,
